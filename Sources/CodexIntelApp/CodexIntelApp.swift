@@ -34,6 +34,7 @@ struct CommandOutput {
 enum ViewModelError: LocalizedError {
     case projectNotSelected
     case emptyPrompt
+    case codexNotFound
 
     var errorDescription: String? {
         switch self {
@@ -41,6 +42,8 @@ enum ViewModelError: LocalizedError {
             return "Select a project folder first."
         case .emptyPrompt:
             return "Prompt is empty."
+        case .codexNotFound:
+            return "Codex CLI not found. Install Codex CLI or install Codex.app in /Applications."
         }
     }
 }
@@ -113,7 +116,7 @@ final class AppViewModel: ObservableObject {
     @Published var busyLabel = ""
 
     private let runner = ShellRunner()
-    private let codexTemplate = "codex exec {prompt}"
+    private var resolvedCodexExecutable: String?
 
     func chooseProjectFolder() {
         let panel = NSOpenPanel()
@@ -147,9 +150,15 @@ final class AppViewModel: ObservableObject {
         Task {
             await runUtilityCommand(
                 label: "Opening in VS Code",
-                command: "code .",
+                command: "if command -v code >/dev/null 2>&1; then code .; else open -a \"Visual Studio Code\" .; fi",
                 includeAsAssistantMessage: false
             )
+        }
+    }
+
+    func installDependencies() {
+        Task {
+            await runDependencyInstaller()
         }
     }
 
@@ -194,11 +203,9 @@ final class AppViewModel: ObservableObject {
     private func runCodex(for userPrompt: String) async {
         do {
             try validateProjectAndTemplate(prompt: userPrompt)
+            let codexExecutable = try await resolveCodexExecutable()
             let enrichedPrompt = buildPromptWithHistory(newPrompt: userPrompt)
-            let command = codexTemplate.replacingOccurrences(
-                of: "{prompt}",
-                with: shellQuote(enrichedPrompt)
-            )
+            let command = "\(shellQuote(codexExecutable)) exec \(shellQuote(enrichedPrompt))"
             let output = try await executeBusyCommand(label: "Running Codex", command: command)
             let response = cleanOutput(output.stdout, fallback: output.stderr)
             messages.append(ChatMessage(role: .assistant, content: response))
@@ -240,7 +247,11 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    private func executeBusyCommand(label: String, command: String) async throws -> CommandOutput {
+    private func executeBusyCommand(
+        label: String,
+        command: String,
+        workingDirectory: String? = nil
+    ) async throws -> CommandOutput {
         isBusy = true
         busyLabel = label
         log("[\(label)] \(command)")
@@ -248,7 +259,8 @@ final class AppViewModel: ObservableObject {
             isBusy = false
             busyLabel = ""
         }
-        return try await runner.run(command: command, workingDirectory: projectPath)
+        let directory = workingDirectory ?? projectPath
+        return try await runner.run(command: command, workingDirectory: directory)
     }
 
     private func validateProjectAndTemplate(prompt: String) throws {
@@ -295,6 +307,41 @@ final class AppViewModel: ObservableObject {
         } catch {
             log("Git info unavailable: \(error.localizedDescription)")
         }
+    }
+
+    private func resolveCodexExecutable() async throws -> String {
+        if let resolvedCodexExecutable {
+            return resolvedCodexExecutable
+        }
+
+        let shellLookup = try await runner.run(
+            command: "command -v codex || true",
+            workingDirectory: projectPath
+        )
+        let fromPath = shellLookup.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !fromPath.isEmpty {
+            resolvedCodexExecutable = fromPath
+            log("Using Codex binary: \(fromPath)")
+            return fromPath
+        }
+
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let candidates = [
+            "/Applications/Codex.app/Contents/Resources/codex",
+            "/Applications/Codex.app/Contents/MacOS/codex",
+            "\(home)/Applications/Codex.app/Contents/Resources/codex",
+            "\(home)/Applications/Codex.app/Contents/MacOS/codex",
+            "/usr/local/bin/codex",
+            "/opt/homebrew/bin/codex"
+        ]
+
+        for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
+            resolvedCodexExecutable = candidate
+            log("Using Codex binary: \(candidate)")
+            return candidate
+        }
+
+        throw ViewModelError.codexNotFound
     }
 
     private func autoCommitAndPushAfterChat() async {
@@ -348,6 +395,50 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    private func runDependencyInstaller() async {
+        let command = """
+        set -e
+        export NONINTERACTIVE=1
+
+        if ! command -v brew >/dev/null 2>&1; then
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        fi
+
+        BREW_BIN="$(command -v brew || true)"
+        if [ -z "$BREW_BIN" ] && [ -x /opt/homebrew/bin/brew ]; then BREW_BIN=/opt/homebrew/bin/brew; fi
+        if [ -z "$BREW_BIN" ] && [ -x /usr/local/bin/brew ]; then BREW_BIN=/usr/local/bin/brew; fi
+        if [ -z "$BREW_BIN" ]; then
+          echo "Homebrew is required but could not be installed."
+          exit 1
+        fi
+
+        eval "$("$BREW_BIN" shellenv)"
+
+        if ! "$BREW_BIN" list git >/dev/null 2>&1; then "$BREW_BIN" install git; fi
+        if ! "$BREW_BIN" list ripgrep >/dev/null 2>&1; then "$BREW_BIN" install ripgrep; fi
+        if ! "$BREW_BIN" list --cask codex >/dev/null 2>&1; then "$BREW_BIN" install --cask codex; fi
+        if ! "$BREW_BIN" list --cask visual-studio-code >/dev/null 2>&1; then "$BREW_BIN" install --cask visual-studio-code || true; fi
+
+        echo "Dependency setup finished."
+        """
+
+        do {
+            let output = try await executeBusyCommand(
+                label: "Installing dependencies",
+                command: command,
+                workingDirectory: nil
+            )
+            resolvedCodexExecutable = nil
+            let details = cleanOutput(output.stdout, fallback: output.stderr)
+            messages.append(ChatMessage(role: .system, content: "Dependency setup complete.\n\(details)"))
+            log("Dependency setup completed.")
+        } catch {
+            let text = error.localizedDescription
+            messages.append(ChatMessage(role: .system, content: "Dependency setup failed: \(text)"))
+            log("Dependency setup failed: \(text)")
+        }
+    }
+
     private func log(_ message: String) {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
@@ -397,6 +488,10 @@ struct ContentView: View {
                         Button("Open Folder") {
                             viewModel.chooseProjectFolder()
                         }
+                        Button("Setup Dependencies") {
+                            viewModel.installDependencies()
+                        }
+                        .disabled(viewModel.isBusy)
                         Button("Open in VS Code") {
                             viewModel.openInVSCode()
                         }

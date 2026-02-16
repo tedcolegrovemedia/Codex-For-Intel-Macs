@@ -7,14 +7,14 @@ Native macOS (SwiftUI) GUI for driving Codex from CLI on Intel Macs.
 1. Open any project folder.
 2. Send conversational prompts to Codex CLI in that folder so it can inspect and modify files.
 3. Open the selected project in VS Code.
-4. Auto-commit and auto-push after each chat turn (plus manual `Push` / `Commit + Push` buttons).
+4. Run one-click dependency setup from the app (`Setup Dependencies`).
+5. Auto-commit and auto-push after each chat turn (plus manual `Push` / `Commit + Push` buttons).
 
 ## Requirements
 
 - macOS 13+ (Intel or Apple Silicon)
 - Xcode 15+ (or recent Swift toolchain with SwiftUI support)
-- Codex CLI installed and on `PATH`
-- VS Code CLI (`code`) installed for the "Open in VS Code" button
+- Internet access for one-click dependency setup
 - Git installed and configured
 
 ## Build and run
@@ -47,6 +47,22 @@ open dist/CodexIntelApp.app
 ## Codex command
 
 The app currently runs `codex exec` internally and passes conversation context + your latest chat message. Commands run with the selected project as the working directory.
+
+If `codex` is not on PATH, the app also checks common install locations like:
+- `/Applications/Codex.app/Contents/Resources/codex`
+- `/Applications/Codex.app/Contents/MacOS/codex`
+- `/usr/local/bin/codex`
+
+## One-click setup
+
+`Setup Dependencies` attempts to install everything needed via Homebrew:
+- Homebrew (if missing)
+- `git`
+- `ripgrep`
+- `codex` (Homebrew cask)
+- Visual Studio Code (best-effort)
+
+This runs inside the app; no manual CLI commands are required. On some systems, macOS may still prompt for permission/password during installs.
 
 ## Git behavior
 
