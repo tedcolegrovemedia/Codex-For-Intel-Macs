@@ -46,9 +46,9 @@ open dist/CodexIntelApp.app
 
 ## Codex command
 
-The app currently runs `codex exec` internally and passes conversation context + your latest chat message. Commands run with the selected project as the working directory.
+The app runs Codex directly (not through a shell `codex` command) with `exec`, then passes conversation context + your latest chat message. Commands run with the selected project as the working directory.
 
-If `codex` is not on PATH, the app also checks common install locations like:
+It auto-searches for executable names (`codex`, `codex-x86_64-apple-darwin`, `codex-aarch64-apple-darwin`) in:
 - `/Applications/Codex.app/Contents/Resources/codex`
 - `/Applications/Codex.app/Contents/MacOS/codex`
 - `/usr/local/bin/codex`

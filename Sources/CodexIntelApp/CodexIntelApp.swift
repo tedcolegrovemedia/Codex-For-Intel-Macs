@@ -62,6 +62,23 @@ struct ShellRunner {
         }
     }
 
+    func run(executablePath: String, arguments: [String], workingDirectory: String?) async throws -> CommandOutput {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let output = try ShellRunner.runSync(
+                        executablePath: executablePath,
+                        arguments: arguments,
+                        workingDirectory: workingDirectory
+                    )
+                    continuation.resume(returning: output)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     private static func runSync(command: String, workingDirectory: String?) throws -> CommandOutput {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
@@ -70,6 +87,25 @@ struct ShellRunner {
             process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
         }
 
+        return try runProcess(process)
+    }
+
+    private static func runSync(
+        executablePath: String,
+        arguments: [String],
+        workingDirectory: String?
+    ) throws -> CommandOutput {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+        if let workingDirectory, !workingDirectory.isEmpty {
+            process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+        }
+
+        return try runProcess(process)
+    }
+
+    private static func runProcess(_ process: Process) throws -> CommandOutput {
         let tempDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
         let stdoutURL = tempDirectory.appendingPathComponent("codex-intel-\(UUID().uuidString)-stdout.log")
         let stderrURL = tempDirectory.appendingPathComponent("codex-intel-\(UUID().uuidString)-stderr.log")
@@ -197,8 +233,11 @@ final class AppViewModel: ObservableObject {
             try validateProjectAndTemplate(prompt: userPrompt)
             let codexExecutable = try await resolveCodexExecutable()
             let enrichedPrompt = buildPromptWithHistory(newPrompt: userPrompt)
-            let command = "\(shellQuote(codexExecutable)) exec \(shellQuote(enrichedPrompt))"
-            let output = try await executeBusyCommand(label: "Running Codex", command: command)
+            let output = try await executeBusyExecutable(
+                label: "Running Codex",
+                executablePath: codexExecutable,
+                arguments: ["exec", enrichedPrompt]
+            )
             let response = cleanOutput(output.stdout, fallback: output.stderr)
             messages.append(ChatMessage(role: .assistant, content: response))
             if output.exitCode != 0 {
@@ -251,6 +290,28 @@ final class AppViewModel: ObservableObject {
         return try await runner.run(command: command, workingDirectory: directory)
     }
 
+    private func executeBusyExecutable(
+        label: String,
+        executablePath: String,
+        arguments: [String],
+        workingDirectory: String? = nil
+    ) async throws -> CommandOutput {
+        isBusy = true
+        busyLabel = label
+        let rendered = ([shellQuote(executablePath)] + arguments.map { shellQuote($0) }).joined(separator: " ")
+        log("[\(label)] \(rendered)")
+        defer {
+            isBusy = false
+            busyLabel = ""
+        }
+        let directory = workingDirectory ?? projectPath
+        return try await runner.run(
+            executablePath: executablePath,
+            arguments: arguments,
+            workingDirectory: directory
+        )
+    }
+
     private func validateProjectAndTemplate(prompt: String) throws {
         try validateProjectSelected()
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -282,41 +343,53 @@ final class AppViewModel: ObservableObject {
     }
 
     private func resolveCodexExecutable() async throws -> String {
-        if let resolvedCodexExecutable {
+        if let resolvedCodexExecutable, FileManager.default.isExecutableFile(atPath: resolvedCodexExecutable) {
             return resolvedCodexExecutable
         }
+        resolvedCodexExecutable = nil
 
-        let shellLookup = try await runner.run(
-            command: "command -v codex || true",
-            workingDirectory: projectPath
-        )
-        let fromPath = shellLookup.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        if fromPath.hasPrefix("/") && FileManager.default.isExecutableFile(atPath: fromPath) {
-            resolvedCodexExecutable = fromPath
-            log("Using Codex binary: \(fromPath)")
-            return fromPath
-        }
-
+        let codexNames = ["codex", "codex-x86_64-apple-darwin", "codex-aarch64-apple-darwin"]
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         var candidates: [String] = []
-        if let bundled = Bundle.main.resourceURL?.appendingPathComponent("codex").path {
-            candidates.append(bundled)
+        if let resources = Bundle.main.resourceURL?.path {
+            for name in codexNames {
+                candidates.append("\(resources)/\(name)")
+            }
         }
-        candidates.append(contentsOf: [
-            "/Applications/Codex.app/Contents/Resources/codex",
-            "/Applications/Codex.app/Contents/MacOS/codex",
-            "\(home)/Applications/Codex.app/Contents/Resources/codex",
-            "\(home)/Applications/Codex.app/Contents/MacOS/codex",
-            "/usr/local/bin/codex",
-            "/opt/homebrew/bin/codex"
-        ])
 
-        for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
+        let fixedDirectories = [
+            "/Applications/Codex.app/Contents/Resources",
+            "/Applications/Codex.app/Contents/MacOS",
+            "\(home)/Applications/Codex.app/Contents/Resources",
+            "\(home)/Applications/Codex.app/Contents/MacOS",
+            "/usr/local/bin",
+            "/opt/homebrew/bin",
+            "/usr/bin",
+            "/bin"
+        ]
+        for directory in fixedDirectories {
+            for name in codexNames {
+                candidates.append("\(directory)/\(name)")
+            }
+        }
+
+        let envPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        for directory in envPath.split(separator: ":").map(String.init) where !directory.isEmpty {
+            for name in codexNames {
+                candidates.append("\(directory)/\(name)")
+            }
+        }
+
+        var seen = Set<String>()
+        let orderedCandidates = candidates.filter { seen.insert($0).inserted }
+
+        for candidate in orderedCandidates where FileManager.default.isExecutableFile(atPath: candidate) {
             resolvedCodexExecutable = candidate
             log("Using Codex binary: \(candidate)")
             return candidate
         }
 
+        log("Codex search failed across \(orderedCandidates.count) candidate paths.")
         throw ViewModelError.codexNotFound
     }
 
