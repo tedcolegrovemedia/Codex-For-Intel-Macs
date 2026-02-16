@@ -6,8 +6,8 @@ Native macOS (SwiftUI) GUI for driving Codex from CLI on Intel Macs.
 
 1. Open any project folder.
 2. Send conversational prompts to Codex CLI in that folder so it can inspect and modify files.
-3. Open the selected project in VS Code and run a test command.
-4. Push with git before or after conversation turns (`Push` or `Commit + Push`).
+3. Open the selected project in VS Code.
+4. Auto-commit and auto-push after each chat turn (plus manual `Push` / `Commit + Push` buttons).
 
 ## Requirements
 
@@ -44,23 +44,16 @@ cd "/Users/tedcolegrove/Desktop/Move to Dev/Dev/Codex for Intel"
 open dist/CodexIntelApp.app
 ```
 
-## Codex CLI template
+## Codex command
 
-Default template is:
-
-```text
-codex exec {prompt}
-```
-
-If your Codex CLI uses different syntax, update the "Codex CLI" field in the app.
-
-Notes:
-- `{prompt}` is required and will be replaced with the conversation payload.
-- Do not wrap `{prompt}` in extra quotes, the app already shell-quotes it.
-- Commands run with the selected project as the working directory.
+The app currently runs `codex exec` internally and passes conversation context + your latest chat message. Commands run with the selected project as the working directory.
 
 ## Git behavior
 
+- After each chat turn, the app runs:
+  - `git add -A`
+  - commit only if there are staged changes
+  - `git push -u <remote> <branch>`
 - `Push`: runs `git push <remote> <branch>` (or only remote if branch is blank)
 - `Commit + Push`: runs `git add -A && git commit -m "<message>" && git push ...`
 

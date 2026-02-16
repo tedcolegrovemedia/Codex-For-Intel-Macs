@@ -33,15 +33,12 @@ struct CommandOutput {
 
 enum ViewModelError: LocalizedError {
     case projectNotSelected
-    case promptPlaceholderMissing
     case emptyPrompt
 
     var errorDescription: String? {
         switch self {
         case .projectNotSelected:
             return "Select a project folder first."
-        case .promptPlaceholderMissing:
-            return "Codex command template must include {prompt}."
         case .emptyPrompt:
             return "Prompt is empty."
         }
@@ -100,8 +97,6 @@ struct ShellRunner {
 @MainActor
 final class AppViewModel: ObservableObject {
     @Published var projectPath = ""
-    @Published var codexTemplate = "codex exec {prompt}"
-    @Published var testCommand = "npm test"
     @Published var gitRemote = "origin"
     @Published var gitBranch = ""
     @Published var commitMessage = "Update via CodexIntelApp"
@@ -118,6 +113,7 @@ final class AppViewModel: ObservableObject {
     @Published var busyLabel = ""
 
     private let runner = ShellRunner()
+    private let codexTemplate = "codex exec {prompt}"
 
     func chooseProjectFolder() {
         let panel = NSOpenPanel()
@@ -144,16 +140,6 @@ final class AppViewModel: ObservableObject {
 
         Task {
             await runCodex(for: prompt)
-        }
-    }
-
-    func runTests() {
-        Task {
-            await runUtilityCommand(
-                label: "Running tests",
-                command: testCommand,
-                includeAsAssistantMessage: true
-            )
         }
     }
 
@@ -224,6 +210,7 @@ final class AppViewModel: ObservableObject {
             messages.append(ChatMessage(role: .assistant, content: "Error: \(text)"))
             log("Error: \(text)")
         }
+        await autoCommitAndPushAfterChat()
     }
 
     private func runUtilityCommand(
@@ -266,7 +253,6 @@ final class AppViewModel: ObservableObject {
 
     private func validateProjectAndTemplate(prompt: String) throws {
         try validateProjectSelected()
-        guard codexTemplate.contains("{prompt}") else { throw ViewModelError.promptPlaceholderMissing }
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ViewModelError.emptyPrompt
         }
@@ -308,6 +294,57 @@ final class AppViewModel: ObservableObject {
             }
         } catch {
             log("Git info unavailable: \(error.localizedDescription)")
+        }
+    }
+
+    private func autoCommitAndPushAfterChat() async {
+        let project = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !project.isEmpty else { return }
+
+        let remote = gitRemote.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !remote.isEmpty else {
+            log("Auto push skipped: git remote is empty.")
+            return
+        }
+
+        let commit = commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "Update via CodexIntelApp"
+            : commitMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var branch = gitBranch.trimmingCharacters(in: .whitespacesAndNewlines)
+        if branch.isEmpty {
+            do {
+                let branchOutput = try await runner.run(
+                    command: "git rev-parse --abbrev-ref HEAD",
+                    workingDirectory: projectPath
+                )
+                branch = branchOutput.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            } catch {
+                log("Auto push skipped: unable to detect git branch (\(error.localizedDescription)).")
+                return
+            }
+        }
+
+        guard !branch.isEmpty else {
+            log("Auto push skipped: git branch is empty.")
+            return
+        }
+
+        let command = "git add -A && (git diff --cached --quiet || git commit -m \(shellQuote(commit))) && git push -u \(shellQuote(remote)) \(shellQuote(branch))"
+
+        do {
+            let output = try await executeBusyCommand(label: "Auto commit + push", command: command)
+            if output.exitCode != 0 {
+                let details = cleanOutput(output.stdout, fallback: output.stderr)
+                log("Auto push failed with code \(output.exitCode): \(details)")
+                messages.append(ChatMessage(role: .system, content: "Auto push failed: \(details)"))
+            } else {
+                log("Auto push completed for \(remote)/\(branch).")
+            }
+            await refreshGitInfo()
+        } catch {
+            log("Auto push error: \(error.localizedDescription)")
+            messages.append(ChatMessage(role: .system, content: "Auto push error: \(error.localizedDescription)"))
         }
     }
 
@@ -365,31 +402,6 @@ struct ContentView: View {
                         }
                         .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy)
                     }
-                }
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Codex CLI")
-                        .font(.headline)
-                    TextField("codex exec {prompt}", text: $viewModel.codexTemplate)
-                        .textFieldStyle(.roundedBorder)
-                    Text("Use {prompt} where the built conversation should be inserted.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Test Command")
-                        .font(.headline)
-                    TextField("npm test", text: $viewModel.testCommand)
-                        .textFieldStyle(.roundedBorder)
-                    Button("Run Tests") {
-                        viewModel.runTests()
-                    }
-                    .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy)
                 }
 
                 Divider()
@@ -470,15 +482,16 @@ struct ContentView: View {
             .padding(.horizontal, 16)
 
             HStack(alignment: .bottom, spacing: 10) {
-                TextField("Ask Codex to edit files, run commands, or implement features...", text: $viewModel.draftPrompt, axis: .vertical)
+                TextField("Ask Codex to edit files, run commands, or implement features...", text: $viewModel.draftPrompt)
                     .textFieldStyle(.roundedBorder)
-                    .lineLimit(1...6)
                     .disabled(viewModel.isBusy)
+                    .onSubmit {
+                        viewModel.sendPrompt()
+                    }
 
                 Button("Send") {
                     viewModel.sendPrompt()
                 }
-                .keyboardShortcut(.return, modifiers: [.command])
                 .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy || viewModel.draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             .padding(.horizontal, 16)
