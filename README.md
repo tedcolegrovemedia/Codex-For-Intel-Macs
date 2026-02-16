@@ -53,6 +53,8 @@ It auto-searches for executable names (`codex`, `codex-x86_64-apple-darwin`, `co
 - `/Applications/Codex.app/Contents/MacOS/codex`
 - `/usr/local/bin/codex`
 
+The app also injects a fallback PATH (`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` + Codex app paths) to avoid GUI PATH issues that cause exit code `127`.
+
 ## One-click setup
 
 `Setup Dependencies` attempts to install everything needed via Homebrew:

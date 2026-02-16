@@ -49,27 +49,18 @@ enum ViewModelError: LocalizedError {
 }
 
 struct ShellRunner {
-    func run(command: String, workingDirectory: String?) async throws -> CommandOutput {
-        try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    let output = try ShellRunner.runSync(command: command, workingDirectory: workingDirectory)
-                    continuation.resume(returning: output)
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
-    }
-
-    func run(executablePath: String, arguments: [String], workingDirectory: String?) async throws -> CommandOutput {
+    func run(
+        command: String,
+        workingDirectory: String?,
+        environment: [String: String]? = nil
+    ) async throws -> CommandOutput {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     let output = try ShellRunner.runSync(
-                        executablePath: executablePath,
-                        arguments: arguments,
-                        workingDirectory: workingDirectory
+                        command: command,
+                        workingDirectory: workingDirectory,
+                        environment: environment
                     )
                     continuation.resume(returning: output)
                 } catch {
@@ -79,7 +70,34 @@ struct ShellRunner {
         }
     }
 
-    private static func runSync(command: String, workingDirectory: String?) throws -> CommandOutput {
+    func run(
+        executablePath: String,
+        arguments: [String],
+        workingDirectory: String?,
+        environment: [String: String]? = nil
+    ) async throws -> CommandOutput {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let output = try ShellRunner.runSync(
+                        executablePath: executablePath,
+                        arguments: arguments,
+                        workingDirectory: workingDirectory,
+                        environment: environment
+                    )
+                    continuation.resume(returning: output)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private static func runSync(
+        command: String,
+        workingDirectory: String?,
+        environment: [String: String]? = nil
+    ) throws -> CommandOutput {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         process.arguments = ["-lc", command]
@@ -87,13 +105,15 @@ struct ShellRunner {
             process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
         }
 
-        return try runProcess(process)
+        let env = environment ?? enrichedEnvironment()
+        return try runProcess(process, environment: env)
     }
 
     private static func runSync(
         executablePath: String,
         arguments: [String],
-        workingDirectory: String?
+        workingDirectory: String?,
+        environment: [String: String]? = nil
     ) throws -> CommandOutput {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
@@ -102,10 +122,14 @@ struct ShellRunner {
             process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
         }
 
-        return try runProcess(process)
+        let executableDirectory = URL(fileURLWithPath: executablePath).deletingLastPathComponent().path
+        let env = environment ?? enrichedEnvironment(extraPathDirectories: [executableDirectory])
+        return try runProcess(process, environment: env)
     }
 
-    private static func runProcess(_ process: Process) throws -> CommandOutput {
+    private static func runProcess(_ process: Process, environment: [String: String]) throws -> CommandOutput {
+        process.environment = environment
+
         let tempDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
         let stdoutURL = tempDirectory.appendingPathComponent("codex-intel-\(UUID().uuidString)-stdout.log")
         let stderrURL = tempDirectory.appendingPathComponent("codex-intel-\(UUID().uuidString)-stderr.log")
@@ -130,6 +154,38 @@ struct ShellRunner {
         let stdout = (try? String(contentsOf: stdoutURL, encoding: .utf8)) ?? ""
         let stderr = (try? String(contentsOf: stderrURL, encoding: .utf8)) ?? ""
         return CommandOutput(stdout: stdout, stderr: stderr, exitCode: process.terminationStatus)
+    }
+
+    private static func enrichedEnvironment(extraPathDirectories: [String] = []) -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let currentPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        let existing = currentPath.split(separator: ":").map(String.init)
+
+        let defaults = [
+            "/Applications/Codex.app/Contents/Resources",
+            "/Applications/Codex.app/Contents/MacOS",
+            "\(home)/Applications/Codex.app/Contents/Resources",
+            "\(home)/Applications/Codex.app/Contents/MacOS",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin"
+        ]
+
+        let combined = extraPathDirectories + existing + defaults
+        var seen = Set<String>()
+        let deduped = combined.filter { entry in
+            let trimmed = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return false }
+            return seen.insert(trimmed).inserted
+        }
+
+        env["PATH"] = deduped.joined(separator: ":")
+        return env
     }
 }
 
@@ -238,11 +294,14 @@ final class AppViewModel: ObservableObject {
                 executablePath: codexExecutable,
                 arguments: ["exec", enrichedPrompt]
             )
-            let response = cleanOutput(output.stdout, fallback: output.stderr)
-            messages.append(ChatMessage(role: .assistant, content: response))
             if output.exitCode != 0 {
                 log("Codex exited with code \(output.exitCode)")
+                let errorText = preferredFailureText(output)
+                messages.append(ChatMessage(role: .assistant, content: "Codex failed (\(output.exitCode)).\n\(errorText)"))
+                return
             }
+            let response = cleanOutput(output.stdout, fallback: output.stderr)
+            messages.append(ChatMessage(role: .assistant, content: response))
         } catch {
             let text = error.localizedDescription
             messages.append(ChatMessage(role: .assistant, content: "Error: \(text)"))
@@ -277,7 +336,8 @@ final class AppViewModel: ObservableObject {
     private func executeBusyCommand(
         label: String,
         command: String,
-        workingDirectory: String? = nil
+        workingDirectory: String? = nil,
+        environment: [String: String]? = nil
     ) async throws -> CommandOutput {
         isBusy = true
         busyLabel = label
@@ -287,14 +347,19 @@ final class AppViewModel: ObservableObject {
             busyLabel = ""
         }
         let directory = workingDirectory ?? projectPath
-        return try await runner.run(command: command, workingDirectory: directory)
+        return try await runner.run(
+            command: command,
+            workingDirectory: directory,
+            environment: environment
+        )
     }
 
     private func executeBusyExecutable(
         label: String,
         executablePath: String,
         arguments: [String],
-        workingDirectory: String? = nil
+        workingDirectory: String? = nil,
+        environment: [String: String]? = nil
     ) async throws -> CommandOutput {
         isBusy = true
         busyLabel = label
@@ -308,7 +373,8 @@ final class AppViewModel: ObservableObject {
         return try await runner.run(
             executablePath: executablePath,
             arguments: arguments,
-            workingDirectory: directory
+            workingDirectory: directory,
+            environment: environment
         )
     }
 
@@ -485,6 +551,14 @@ final class AppViewModel: ObservableObject {
         let err = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         if !err.isEmpty { return err }
         return "(No output)"
+    }
+
+    private func preferredFailureText(_ output: CommandOutput) -> String {
+        let err = output.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !err.isEmpty { return err }
+        let out = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !out.isEmpty { return out }
+        return "(No error details)"
     }
 
     private func shellQuote(_ value: String) -> String {
