@@ -66,11 +66,12 @@ This runs inside the app; no manual CLI commands are required. On some systems, 
 
 ## Git behavior
 
+- Git actions are enabled only when both `Remote` and `Branch` fields are filled in.
 - After each chat turn, the app runs:
   - `git add -A`
   - commit only if there are staged changes
   - `git push -u <remote> <branch>`
-- `Push`: runs `git push <remote> <branch>` (or only remote if branch is blank)
+- `Push`: runs `git push <remote> <branch>`
 - `Commit + Push`: runs `git add -A && git commit -m "<message>" && git push ...`
 
 You can run git actions before starting the conversation or at any point later.

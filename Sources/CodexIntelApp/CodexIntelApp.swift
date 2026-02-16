@@ -100,7 +100,7 @@ struct ShellRunner {
 @MainActor
 final class AppViewModel: ObservableObject {
     @Published var projectPath = ""
-    @Published var gitRemote = "origin"
+    @Published var gitRemote = ""
     @Published var gitBranch = ""
     @Published var commitMessage = "Update via CodexIntelApp"
     @Published var draftPrompt = ""
@@ -117,6 +117,10 @@ final class AppViewModel: ObservableObject {
 
     private let runner = ShellRunner()
     private var resolvedCodexExecutable: String?
+    var isGitConfigured: Bool {
+        !gitRemote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+        !gitBranch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
     func chooseProjectFolder() {
         let panel = NSOpenPanel()
@@ -129,9 +133,6 @@ final class AppViewModel: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url {
             projectPath = url.path
             log("Selected project: \(projectPath)")
-            Task {
-                await refreshGitInfo()
-            }
         }
     }
 
@@ -163,11 +164,8 @@ final class AppViewModel: ObservableObject {
     }
 
     func gitPush() {
-        let branch = gitBranch.trimmingCharacters(in: .whitespacesAndNewlines)
-        let remote = gitRemote.trimmingCharacters(in: .whitespacesAndNewlines)
-        let pushCommand = branch.isEmpty
-            ? "git push \(shellQuote(remote))"
-            : "git push \(shellQuote(remote)) \(shellQuote(branch))"
+        guard let target = configuredGitTarget() else { return }
+        let pushCommand = "git push \(shellQuote(target.remote)) \(shellQuote(target.branch))"
 
         Task {
             await runUtilityCommand(
@@ -181,15 +179,9 @@ final class AppViewModel: ObservableObject {
     func gitCommitAndPush() {
         let message = commitMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         let commit = message.isEmpty ? "Update via CodexIntelApp" : message
-        let branch = gitBranch.trimmingCharacters(in: .whitespacesAndNewlines)
-        let remote = gitRemote.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let target = configuredGitTarget() else { return }
 
-        var command = "git add -A && git commit -m \(shellQuote(commit))"
-        if branch.isEmpty {
-            command += " && git push \(shellQuote(remote))"
-        } else {
-            command += " && git push \(shellQuote(remote)) \(shellQuote(branch))"
-        }
+        let command = "git add -A && git commit -m \(shellQuote(commit)) && git push \(shellQuote(target.remote)) \(shellQuote(target.branch))"
 
         Task {
             await runUtilityCommand(
@@ -236,10 +228,6 @@ final class AppViewModel: ObservableObject {
 
             if output.exitCode != 0 {
                 log("\(label) exited with code \(output.exitCode)")
-            }
-
-            if label == "Pushing git branch" || label == "Committing and pushing" {
-                await refreshGitInfo()
             }
         } catch {
             log("Error: \(error.localizedDescription)")
@@ -293,22 +281,6 @@ final class AppViewModel: ObservableObject {
         """
     }
 
-    private func refreshGitInfo() async {
-        do {
-            try validateProjectSelected()
-            let branch = try await runner.run(
-                command: "git rev-parse --abbrev-ref HEAD",
-                workingDirectory: projectPath
-            )
-            let cleanBranch = branch.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !cleanBranch.isEmpty {
-                gitBranch = cleanBranch
-            }
-        } catch {
-            log("Git info unavailable: \(error.localizedDescription)")
-        }
-    }
-
     private func resolveCodexExecutable() async throws -> String {
         if let resolvedCodexExecutable {
             return resolvedCodexExecutable
@@ -319,21 +291,25 @@ final class AppViewModel: ObservableObject {
             workingDirectory: projectPath
         )
         let fromPath = shellLookup.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !fromPath.isEmpty {
+        if fromPath.hasPrefix("/") && FileManager.default.isExecutableFile(atPath: fromPath) {
             resolvedCodexExecutable = fromPath
             log("Using Codex binary: \(fromPath)")
             return fromPath
         }
 
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let candidates = [
+        var candidates: [String] = []
+        if let bundled = Bundle.main.resourceURL?.appendingPathComponent("codex").path {
+            candidates.append(bundled)
+        }
+        candidates.append(contentsOf: [
             "/Applications/Codex.app/Contents/Resources/codex",
             "/Applications/Codex.app/Contents/MacOS/codex",
             "\(home)/Applications/Codex.app/Contents/Resources/codex",
             "\(home)/Applications/Codex.app/Contents/MacOS/codex",
             "/usr/local/bin/codex",
             "/opt/homebrew/bin/codex"
-        ]
+        ])
 
         for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
             resolvedCodexExecutable = candidate
@@ -347,37 +323,12 @@ final class AppViewModel: ObservableObject {
     private func autoCommitAndPushAfterChat() async {
         let project = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !project.isEmpty else { return }
-
-        let remote = gitRemote.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !remote.isEmpty else {
-            log("Auto push skipped: git remote is empty.")
-            return
-        }
+        guard let target = configuredGitTarget() else { return }
 
         let commit = commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "Update via CodexIntelApp"
             : commitMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        var branch = gitBranch.trimmingCharacters(in: .whitespacesAndNewlines)
-        if branch.isEmpty {
-            do {
-                let branchOutput = try await runner.run(
-                    command: "git rev-parse --abbrev-ref HEAD",
-                    workingDirectory: projectPath
-                )
-                branch = branchOutput.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-            } catch {
-                log("Auto push skipped: unable to detect git branch (\(error.localizedDescription)).")
-                return
-            }
-        }
-
-        guard !branch.isEmpty else {
-            log("Auto push skipped: git branch is empty.")
-            return
-        }
-
-        let command = "git add -A && (git diff --cached --quiet || git commit -m \(shellQuote(commit))) && git push -u \(shellQuote(remote)) \(shellQuote(branch))"
+        let command = "git add -A && (git diff --cached --quiet || git commit -m \(shellQuote(commit))) && git push -u \(shellQuote(target.remote)) \(shellQuote(target.branch))"
 
         do {
             let output = try await executeBusyCommand(label: "Auto commit + push", command: command)
@@ -386,13 +337,22 @@ final class AppViewModel: ObservableObject {
                 log("Auto push failed with code \(output.exitCode): \(details)")
                 messages.append(ChatMessage(role: .system, content: "Auto push failed: \(details)"))
             } else {
-                log("Auto push completed for \(remote)/\(branch).")
+                log("Auto push completed for \(target.remote)/\(target.branch).")
             }
-            await refreshGitInfo()
         } catch {
             log("Auto push error: \(error.localizedDescription)")
             messages.append(ChatMessage(role: .system, content: "Auto push error: \(error.localizedDescription)"))
         }
+    }
+
+    private func configuredGitTarget() -> (remote: String, branch: String)? {
+        let remote = gitRemote.trimmingCharacters(in: .whitespacesAndNewlines)
+        let branch = gitBranch.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !remote.isEmpty && !branch.isEmpty else {
+            log("Git skipped: fill both Remote and Branch to enable git actions.")
+            return nil
+        }
+        return (remote, branch)
     }
 
     private func runDependencyInstaller() async {
@@ -514,12 +474,12 @@ struct ContentView: View {
                         Button("Push") {
                             viewModel.gitPush()
                         }
-                        .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy)
+                        .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy || !viewModel.isGitConfigured)
 
                         Button("Commit + Push") {
                             viewModel.gitCommitAndPush()
                         }
-                        .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy)
+                        .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy || !viewModel.isGitConfigured)
                     }
                 }
 
