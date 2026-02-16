@@ -43,7 +43,7 @@ enum ViewModelError: LocalizedError {
         case .emptyPrompt:
             return "Prompt is empty."
         case .codexNotFound:
-            return "Codex CLI not found. Install Codex CLI or install Codex.app in /Applications."
+            return "Codex CLI not found. Use Setup Dependencies or set Codex Path in the app."
         }
     }
 }
@@ -192,6 +192,7 @@ struct ShellRunner {
 @MainActor
 final class AppViewModel: ObservableObject {
     @Published var projectPath = ""
+    @Published var codexPathOverride = ""
     @Published var gitRemote = ""
     @Published var gitBranch = ""
     @Published var commitMessage = "Update via CodexIntelApp"
@@ -209,6 +210,7 @@ final class AppViewModel: ObservableObject {
 
     private let runner = ShellRunner()
     private var resolvedCodexExecutable: String?
+    private var didAttemptAutoInstallCodex = false
     var isGitConfigured: Bool {
         !gitRemote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         !gitBranch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -225,6 +227,21 @@ final class AppViewModel: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url {
             projectPath = url.path
             log("Selected project: \(projectPath)")
+        }
+    }
+
+    func chooseCodexBinary() {
+        let panel = NSOpenPanel()
+        panel.title = "Select Codex Binary"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.resolvesAliases = true
+
+        if panel.runModal() == .OK, let url = panel.url {
+            codexPathOverride = url.path
+            resolvedCodexExecutable = nil
+            log("Configured Codex path override: \(url.path)")
         }
     }
 
@@ -287,7 +304,7 @@ final class AppViewModel: ObservableObject {
     private func runCodex(for userPrompt: String) async {
         do {
             try validateProjectAndTemplate(prompt: userPrompt)
-            let codexExecutable = try await resolveCodexExecutable()
+            let codexExecutable = try await ensureCodexExecutableAvailable()
             let enrichedPrompt = buildPromptWithHistory(newPrompt: userPrompt)
             let output = try await executeBusyExecutable(
                 label: "Running Codex",
@@ -308,6 +325,35 @@ final class AppViewModel: ObservableObject {
             log("Error: \(text)")
         }
         await autoCommitAndPushAfterChat()
+    }
+
+    private func ensureCodexExecutableAvailable() async throws -> String {
+        do {
+            return try await resolveCodexExecutable()
+        } catch ViewModelError.codexNotFound {
+            guard !didAttemptAutoInstallCodex else { throw ViewModelError.codexNotFound }
+            didAttemptAutoInstallCodex = true
+            log("Codex not found. Attempting automatic Codex CLI installation.")
+
+            do {
+                let output = try await installCodexCliOnly()
+                if output.exitCode != 0 {
+                    let details = preferredFailureText(output)
+                    log("Codex auto-install command failed (\(output.exitCode)): \(details)")
+                    messages.append(ChatMessage(role: .system, content: "Codex auto-install failed (\(output.exitCode)).\n\(details)"))
+                    throw ViewModelError.codexNotFound
+                }
+                let details = cleanOutput(output.stdout, fallback: output.stderr)
+                log("Codex auto-install finished: \(details)")
+                resolvedCodexExecutable = nil
+                let executable = try await resolveCodexExecutable()
+                messages.append(ChatMessage(role: .system, content: "Codex CLI installed automatically."))
+                return executable
+            } catch {
+                log("Codex auto-install failed: \(error.localizedDescription)")
+                throw ViewModelError.codexNotFound
+            }
+        }
     }
 
     private func runUtilityCommand(
@@ -416,6 +462,26 @@ final class AppViewModel: ObservableObject {
 
         let codexNames = ["codex", "codex-x86_64-apple-darwin", "codex-aarch64-apple-darwin"]
         let home = FileManager.default.homeDirectoryForCurrentUser.path
+
+        let overridePath = (codexPathOverride as NSString).expandingTildeInPath
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !overridePath.isEmpty {
+            if FileManager.default.isExecutableFile(atPath: overridePath) {
+                resolvedCodexExecutable = overridePath
+                log("Using Codex override: \(overridePath)")
+                return overridePath
+            }
+            log("Configured Codex path is not executable: \(overridePath)")
+        }
+
+        let envOverride = (ProcessInfo.processInfo.environment["CODEX_BINARY"] ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !envOverride.isEmpty && FileManager.default.isExecutableFile(atPath: envOverride) {
+            resolvedCodexExecutable = envOverride
+            log("Using Codex from CODEX_BINARY: \(envOverride)")
+            return envOverride
+        }
+
         var candidates: [String] = []
         if let resources = Bundle.main.resourceURL?.path {
             for name in codexNames {
@@ -443,6 +509,36 @@ final class AppViewModel: ObservableObject {
         for directory in envPath.split(separator: ":").map(String.init) where !directory.isEmpty {
             for name in codexNames {
                 candidates.append("\(directory)/\(name)")
+            }
+        }
+
+        let caskRoots = [
+            "/usr/local/Caskroom/codex",
+            "/opt/homebrew/Caskroom/codex"
+        ]
+        for root in caskRoots {
+            if let versions = try? FileManager.default.contentsOfDirectory(atPath: root) {
+                for version in versions {
+                    for name in codexNames {
+                        candidates.append("\(root)/\(version)/\(name)")
+                    }
+                }
+            }
+        }
+
+        let appBases = [
+            "/Applications",
+            "\(home)/Applications"
+        ]
+        for appBase in appBases {
+            if let entries = try? FileManager.default.contentsOfDirectory(atPath: appBase) {
+                for entry in entries where entry.lowercased().contains("codex") && entry.hasSuffix(".app") {
+                    for subDirectory in ["Contents/Resources", "Contents/MacOS"] {
+                        for name in codexNames {
+                            candidates.append("\(appBase)/\(entry)/\(subDirectory)/\(name)")
+                        }
+                    }
+                }
             }
         }
 
@@ -495,7 +591,43 @@ final class AppViewModel: ObservableObject {
     }
 
     private func runDependencyInstaller() async {
-        let command = """
+        let command = dependencyInstallScript(includeExtras: true)
+
+        do {
+            let output = try await executeBusyCommand(
+                label: "Installing dependencies",
+                command: command,
+                workingDirectory: nil
+            )
+            resolvedCodexExecutable = nil
+            let details = cleanOutput(output.stdout, fallback: output.stderr)
+            messages.append(ChatMessage(role: .system, content: "Dependency setup complete.\n\(details)"))
+            log("Dependency setup completed.")
+        } catch {
+            let text = error.localizedDescription
+            messages.append(ChatMessage(role: .system, content: "Dependency setup failed: \(text)"))
+            log("Dependency setup failed: \(text)")
+        }
+    }
+
+    private func installCodexCliOnly() async throws -> CommandOutput {
+        let command = dependencyInstallScript(includeExtras: false)
+        return try await executeBusyCommand(
+            label: "Auto-installing Codex CLI",
+            command: command,
+            workingDirectory: nil
+        )
+    }
+
+    private func dependencyInstallScript(includeExtras: Bool) -> String {
+        let extraInstalls = includeExtras
+            ? """
+            if ! "$BREW_BIN" list git >/dev/null 2>&1; then "$BREW_BIN" install git; fi
+            if ! "$BREW_BIN" list --cask visual-studio-code >/dev/null 2>&1; then "$BREW_BIN" install --cask visual-studio-code || true; fi
+            """
+            : ""
+
+        return """
         set -e
         export NONINTERACTIVE=1
 
@@ -513,29 +645,11 @@ final class AppViewModel: ObservableObject {
 
         eval "$("$BREW_BIN" shellenv)"
 
-        if ! "$BREW_BIN" list git >/dev/null 2>&1; then "$BREW_BIN" install git; fi
         if ! "$BREW_BIN" list ripgrep >/dev/null 2>&1; then "$BREW_BIN" install ripgrep; fi
         if ! "$BREW_BIN" list --cask codex >/dev/null 2>&1; then "$BREW_BIN" install --cask codex; fi
-        if ! "$BREW_BIN" list --cask visual-studio-code >/dev/null 2>&1; then "$BREW_BIN" install --cask visual-studio-code || true; fi
-
+        \(extraInstalls)
         echo "Dependency setup finished."
         """
-
-        do {
-            let output = try await executeBusyCommand(
-                label: "Installing dependencies",
-                command: command,
-                workingDirectory: nil
-            )
-            resolvedCodexExecutable = nil
-            let details = cleanOutput(output.stdout, fallback: output.stderr)
-            messages.append(ChatMessage(role: .system, content: "Dependency setup complete.\n\(details)"))
-            log("Dependency setup completed.")
-        } catch {
-            let text = error.localizedDescription
-            messages.append(ChatMessage(role: .system, content: "Dependency setup failed: \(text)"))
-            log("Dependency setup failed: \(text)")
-        }
     }
 
     private func log(_ message: String) {
@@ -595,6 +709,10 @@ struct ContentView: View {
                         Button("Open Folder") {
                             viewModel.chooseProjectFolder()
                         }
+                        Button("Locate Codex") {
+                            viewModel.chooseCodexBinary()
+                        }
+                        .disabled(viewModel.isBusy)
                         Button("Setup Dependencies") {
                             viewModel.installDependencies()
                         }
@@ -604,6 +722,9 @@ struct ContentView: View {
                         }
                         .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy)
                     }
+                    TextField("Codex Path (optional override)", text: $viewModel.codexPathOverride)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(viewModel.isBusy)
                 }
 
                 Divider()

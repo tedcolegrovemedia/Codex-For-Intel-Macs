@@ -54,6 +54,7 @@ It auto-searches for executable names (`codex`, `codex-x86_64-apple-darwin`, `co
 - `/usr/local/bin/codex`
 
 The app also injects a fallback PATH (`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` + Codex app paths) to avoid GUI PATH issues that cause exit code `127`.
+If needed, set `Codex Path (optional override)` in the app or use env var `CODEX_BINARY=/absolute/path/to/codex`.
 
 ## One-click setup
 
@@ -65,6 +66,8 @@ The app also injects a fallback PATH (`/opt/homebrew/bin:/usr/local/bin:/usr/bin
 - Visual Studio Code (best-effort)
 
 This runs inside the app; no manual CLI commands are required. On some systems, macOS may still prompt for permission/password during installs.
+
+When you send a chat and Codex is missing, the app also attempts an automatic one-time Codex CLI install (`brew install --cask codex`) and retries.
 
 ## Git behavior
 
