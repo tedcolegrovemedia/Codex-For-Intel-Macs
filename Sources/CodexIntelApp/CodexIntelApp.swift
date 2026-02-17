@@ -496,6 +496,7 @@ final class AppViewModel: ObservableObject {
     private var stopRequested = false
     private var didReportStopForCurrentRun = false
     private var fallbackChangedFiles: [String] = []
+    private var loginFlowOpenedBrowser = false
     private var runHeartbeatTask: Task<Void, Never>?
     private var runStartedAt: Date?
     private var lastProgressAt: Date?
@@ -623,7 +624,7 @@ final class AppViewModel: ObservableObject {
 
     func connectChatGPTAccount() {
         Task {
-            await openCodexLoginInTerminal()
+            await runInAppBrowserLoginFlow()
         }
     }
 
@@ -1107,37 +1108,79 @@ final class AppViewModel: ObservableObject {
         return "Unknown"
     }
 
-    private func openCodexLoginInTerminal() async {
-        let command = """
-        if command -v codex >/dev/null 2>&1; then
-          osascript -e 'tell application "Terminal" to activate' -e 'tell application "Terminal" to do script "codex login"'
-        else
-          echo "Codex CLI not found."
-          exit 127
-        fi
-        """
-
+    private func runInAppBrowserLoginFlow() async {
         do {
-            let output = try await executeBusyCommand(
-                label: "Open Codex Login",
-                command: command,
+            let codexExecutable = try await ensureCodexExecutableAvailable()
+            codexAccountStatus = "Connecting..."
+            loginFlowOpenedBrowser = false
+            appendActivity("Starting browser login flow.")
+
+            let output = try await executeBusyExecutableStreaming(
+                label: "Connect ChatGPT Account",
+                executablePath: codexExecutable,
+                arguments: ["login", "--device-auth"],
                 workingDirectory: nil
-            )
-            if output.exitCode == 0 {
-                messages.append(
-                    ChatMessage(
-                        role: .system,
-                        content: "Opened Terminal for `codex login`. Complete sign-in there, then click Refresh Account Status."
-                    )
-                )
-                appendActivity("Opened Terminal for Codex login.")
+            ) { [weak self] source, line in
+                Task { @MainActor in
+                    self?.handleLoginStreamLine(source: source, line: line)
+                }
+            }
+
+            await refreshCodexAccountStatus()
+            if output.exitCode == 0, isConnectedAccountStatus(codexAccountStatus) {
+                appendActivity("ChatGPT account connected.")
+                messages.append(ChatMessage(role: .system, content: "ChatGPT account connected."))
             } else {
                 let details = conversationSafePlainEnglish(preferredFailureText(output))
-                messages.append(ChatMessage(role: .system, content: "Unable to open login flow: \(details)"))
+                messages.append(ChatMessage(role: .system, content: "Login ended before connection was confirmed. \(details)"))
             }
         } catch {
-            messages.append(ChatMessage(role: .system, content: "Unable to open login flow: \(error.localizedDescription)"))
+            await refreshCodexAccountStatus()
+            messages.append(ChatMessage(role: .system, content: "Unable to start browser login flow: \(error.localizedDescription)"))
         }
+    }
+
+    private func handleLoginStreamLine(source: StreamSource, line: String) {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        if let url = firstURL(in: trimmed), !loginFlowOpenedBrowser {
+            loginFlowOpenedBrowser = true
+            NSWorkspace.shared.open(url)
+            codexAccountStatus = "Waiting for browser sign-in..."
+            appendActivity("Opened browser sign-in page.")
+            return
+        }
+
+        let lowered = trimmed.lowercased()
+        if lowered.contains("waiting") || lowered.contains("authorize") || lowered.contains("browser") {
+            appendActivity("Waiting for browser sign-in...")
+            return
+        }
+
+        if source == .stderr, (lowered.contains("error") || lowered.contains("failed")) {
+            appendActivity(trimmed)
+        }
+    }
+
+    private func firstURL(in text: String) -> URL? {
+        let pattern = #"https?://[^\s\)\]\"]+"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range) else { return nil }
+        guard let matchRange = Range(match.range, in: text) else { return nil }
+        return URL(string: String(text[matchRange]))
+    }
+
+    private func isConnectedAccountStatus(_ status: String) -> Bool {
+        let lowered = status.lowercased()
+        if lowered.contains("not connected") || lowered.contains("cli not found") {
+            return false
+        }
+        if lowered == "checking..." || lowered == "unavailable" || lowered == "unknown" || lowered.contains("connecting") {
+            return false
+        }
+        return true
     }
 
     private func applyModelDefaultsFromConfig() {
@@ -1515,7 +1558,7 @@ final class AppViewModel: ObservableObject {
         }
 
         let listed = fallbackChangedFiles.prefix(limit).map { path in
-            "\(compactSummaryPath(path)) (changed)"
+            "\(compactSummaryPath(path)) (+0/-0)"
         }
         var values = Array(listed)
         let remaining = fallbackChangedFiles.count - listed.count
@@ -1545,7 +1588,7 @@ final class AppViewModel: ObservableObject {
             }
             let count = fallbackChangedFiles.count
             let fileLabel = count == 1 ? "file" : "files"
-            let topFileSummaries = fallbackChangedFiles.prefix(5).map { compactSummaryPath($0) }
+            let topFileSummaries = fallbackChangedFiles.prefix(5).map { "\(compactSummaryPath($0)) (+0/-0)" }
             var summary = "Updated \(count) \(fileLabel)"
             if !topFileSummaries.isEmpty {
                 summary += ": \(topFileSummaries.joined(separator: ", "))"
@@ -2387,6 +2430,11 @@ final class AppViewModel: ObservableObject {
 
         fallbackChangedFiles = Array(Set(found)).sorted()
         if !fallbackChangedFiles.isEmpty {
+            if latestDiffFiles.isEmpty {
+                latestDiffFiles = fallbackChangedFiles.map { DiffFileStat(path: $0, added: 0, removed: 0) }
+                latestDiffAdded = 0
+                latestDiffRemoved = 0
+            }
             appendActivity("Filesystem fallback detected \(fallbackChangedFiles.count) changed file(s).")
         }
     }
