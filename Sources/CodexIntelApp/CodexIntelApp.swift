@@ -1348,20 +1348,19 @@ final class AppViewModel: ObservableObject {
         guard !trimmed.isEmpty else { return }
 
         if let url = firstURL(in: trimmed), !loginFlowOpenedBrowser {
-            loginFlowOpenedBrowser = true
-            NSWorkspace.shared.open(url)
-            codexAccountStatus = "Waiting for browser sign-in..."
-            appendActivity("Opened browser sign-in page.")
+            openBrowserForLogin(url)
             return
         }
 
         let lowered = trimmed.lowercased()
         if lowered.contains("never share this code") || lowered.contains("device code") || lowered.contains("enter code") {
             loginFlowSawDeviceCodePrompt = true
+            openCanonicalDeviceAuthURLIfNeeded()
             appendActivity("Waiting for code confirmation in browser...")
             return
         }
         if lowered.contains("waiting") || lowered.contains("authorize") || lowered.contains("browser") {
+            openCanonicalDeviceAuthURLIfNeeded()
             appendActivity("Waiting for browser sign-in...")
             return
         }
@@ -1380,11 +1379,15 @@ final class AppViewModel: ObservableObject {
         let raw = String(text[matchRange])
         let cleaned = sanitizeCapturedURLString(raw)
         guard !cleaned.isEmpty else { return nil }
-        return URL(string: cleaned)
+        return canonicalizedLoginURL(from: cleaned) ?? URL(string: cleaned)
     }
 
     private func sanitizeCapturedURLString(_ raw: String) -> String {
         var candidate = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let encodedAnsiRange = candidate.range(of: "%1B%5B", options: [.caseInsensitive]) {
+            candidate = String(candidate[..<encodedAnsiRange.lowerBound])
+        }
+        candidate = stripANSIEscapeCodes(from: candidate)
         candidate = candidate.replacingOccurrences(
             of: #"(?i)%1b%5b[0-9;]*[a-z]"#,
             with: "",
@@ -1395,8 +1398,37 @@ final class AppViewModel: ObservableObject {
             with: "",
             options: .regularExpression
         )
+        candidate = candidate.replacingOccurrences(of: "\u{001B}", with: "")
         candidate = candidate.trimmingCharacters(in: CharacterSet(charactersIn: ".,;:!?"))
         return candidate
+    }
+
+    private func canonicalizedLoginURL(from raw: String) -> URL? {
+        guard var components = URLComponents(string: raw) else { return nil }
+        let host = components.host?.lowercased() ?? ""
+        let path = components.path.lowercased()
+        guard host == "auth.openai.com", path.hasPrefix("/codex/device") else {
+            return nil
+        }
+
+        // Normalize malformed device-auth URLs (e.g. ANSI fragments) to a stable endpoint.
+        components.scheme = "https"
+        components.host = "auth.openai.com"
+        components.path = "/codex/device"
+        return components.url
+    }
+
+    private func openCanonicalDeviceAuthURLIfNeeded() {
+        guard !loginFlowOpenedBrowser else { return }
+        guard let url = URL(string: "https://auth.openai.com/codex/device") else { return }
+        openBrowserForLogin(url)
+    }
+
+    private func openBrowserForLogin(_ url: URL) {
+        loginFlowOpenedBrowser = true
+        NSWorkspace.shared.open(url)
+        codexAccountStatus = "Waiting for browser sign-in..."
+        appendActivity("Opened browser sign-in page.")
     }
 
     private func isConnectedAccountStatus(_ status: String) -> Bool {
