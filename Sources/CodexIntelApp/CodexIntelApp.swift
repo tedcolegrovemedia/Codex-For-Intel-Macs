@@ -451,6 +451,7 @@ final class AppViewModel: ObservableObject {
     @Published var codexCliVersion = "Detecting..."
     @Published var codexAccountStatus = "Checking..."
     @Published var codexSessionState = "Not started"
+    @Published var recentProjects: [String] = []
     @Published var selectedModel = "gpt-5.3-codex"
     @Published var selectedReasoningEffort = "xhigh"
     @Published var availableModels = ["gpt-5.3-codex"]
@@ -501,8 +502,11 @@ final class AppViewModel: ObservableObject {
     private var runStartedAt: Date?
     private var lastProgressAt: Date?
     private let genericDoneFallback = "Completed. I applied updates to your project and summarized the result."
+    private let recentProjectsDefaultsKey = "CodexIntelAppRecentProjects"
+    private let maxRecentProjectsCount = 12
 
     init() {
+        loadRecentProjects()
         applyModelDefaultsFromConfig()
         loadModelCatalogFromCache()
         updateReasoningOptionsForSelectedModel()
@@ -530,21 +534,71 @@ final class AppViewModel: ObservableObject {
         panel.canCreateDirectories = true
 
         if panel.runModal() == .OK, let url = panel.url {
-            projectPath = url.path
-            resetSession(reason: nil)
-            log("Selected project: \(projectPath)")
-            Task {
-                await ensureProjectDirectoryTrustAndAccess()
+            activateProject(url.path, installDependencies: true)
+        }
+    }
+
+    func selectRecentProject(_ path: String) {
+        let value = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+
+        var isDirectory = ObjCBool(false)
+        if FileManager.default.fileExists(atPath: value, isDirectory: &isDirectory), isDirectory.boolValue {
+            activateProject(value, installDependencies: false)
+            return
+        }
+
+        recentProjects.removeAll { $0 == value }
+        saveRecentProjects()
+        messages.append(ChatMessage(role: .system, content: "Recent project path is no longer available: \(value)"))
+    }
+
+    private func activateProject(_ path: String, installDependencies: Bool) {
+        projectPath = path
+        addRecentProject(path)
+        resetSession(reason: nil)
+        log("Selected project: \(projectPath)")
+        Task {
+            await ensureProjectDirectoryTrustAndAccess()
+            if installDependencies {
                 await runDependencyInstaller(autoTriggered: true)
-                await refreshCodexVersion()
-                do {
-                    let codexExecutable = try await ensureCodexExecutableAvailable()
-                    await startPersistentAutonomousSessionIfNeeded(executablePath: codexExecutable)
-                } catch {
-                    log("Unable to start persistent session after folder select: \(error.localizedDescription)")
-                }
+            }
+            await refreshCodexVersion()
+            await refreshCodexAccountStatus()
+            do {
+                let codexExecutable = try await ensureCodexExecutableAvailable()
+                await startPersistentAutonomousSessionIfNeeded(executablePath: codexExecutable)
+            } catch {
+                log("Unable to start persistent session after folder select: \(error.localizedDescription)")
             }
         }
+    }
+
+    private func loadRecentProjects() {
+        let stored = UserDefaults.standard.stringArray(forKey: recentProjectsDefaultsKey) ?? []
+        recentProjects = stored.filter { candidate in
+            var isDirectory = ObjCBool(false)
+            return FileManager.default.fileExists(atPath: candidate, isDirectory: &isDirectory) && isDirectory.boolValue
+        }
+        if recentProjects.count != stored.count {
+            saveRecentProjects()
+        }
+    }
+
+    private func saveRecentProjects() {
+        UserDefaults.standard.set(recentProjects, forKey: recentProjectsDefaultsKey)
+    }
+
+    private func addRecentProject(_ path: String) {
+        let value = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        var updated = recentProjects.filter { $0 != value }
+        updated.insert(value, at: 0)
+        if updated.count > maxRecentProjectsCount {
+            updated = Array(updated.prefix(maxRecentProjectsCount))
+        }
+        recentProjects = updated
+        saveRecentProjects()
     }
 
     func chooseCodexBinary() {
@@ -2848,6 +2902,36 @@ struct ContentView: View {
                     Text("Current: \(viewModel.currentModelSummary)")
                         .font(.caption)
                         .foregroundColor(.secondary)
+                }
+
+                if !viewModel.recentProjects.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Recent Projects")
+                            .font(.subheadline.weight(.semibold))
+                        ForEach(viewModel.recentProjects, id: \.self) { path in
+                            Button {
+                                viewModel.selectRecentProject(path)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(URL(fileURLWithPath: path).lastPathComponent)
+                                        .font(.caption.weight(.semibold))
+                                        .lineLimit(1)
+                                    Text(path)
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(8)
+                                .background(
+                                    (path == viewModel.projectPath ? Color.accentColor.opacity(0.14) : Color(nsColor: .controlBackgroundColor))
+                                )
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(viewModel.isBusy)
+                        }
+                    }
                 }
 
                 Divider()
