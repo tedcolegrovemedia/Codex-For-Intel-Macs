@@ -1898,13 +1898,6 @@ final class AppViewModel: ObservableObject {
             lines.append("• \(value)")
         }
 
-        let detailedChanges = detailedChangeReferenceLines(fileLimit: 4, lineLimit: 4)
-        if !detailedChanges.isEmpty {
-            lines.append("")
-            lines.append("Detailed changes:")
-            lines.append(contentsOf: detailedChanges)
-        }
-
         lines.append("")
         lines.append("Validation:")
         lines.append("• \(validation.summaryLine)")
@@ -3402,8 +3395,6 @@ final class AppViewModel: ObservableObject {
 struct ContentView: View {
     @StateObject private var viewModel = AppViewModel()
     @State private var collapsedChangeFiles: Set<String> = []
-    @State private var conversationViewportBottomY: CGFloat = 0
-    @State private var conversationContentBottomY: CGFloat = 0
     @State private var isConversationAtBottom = true
     private let conversationBottomAnchorID = "conversation-bottom-anchor"
 
@@ -3831,12 +3822,6 @@ struct ContentView: View {
         !isConversationAtBottom && !viewModel.messages.isEmpty
     }
 
-    private func updateConversationBottomState() {
-        let threshold: CGFloat = 24
-        let distance = conversationContentBottomY - conversationViewportBottomY
-        isConversationAtBottom = distance <= threshold
-    }
-
     private func scrollConversationToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
         isConversationAtBottom = true
         let action = {
@@ -3877,34 +3862,18 @@ struct ContentView: View {
                             Color.clear
                                 .frame(height: 1)
                                 .id(conversationBottomAnchorID)
-                                .background(
-                                    GeometryReader { geometry in
-                                        Color.clear.preference(
-                                            key: ConversationContentBottomPreferenceKey.self,
-                                            value: geometry.frame(in: .global).maxY
-                                        )
-                                    }
-                                )
                         }
                         .padding(16)
                     }
                     .background(
-                        GeometryReader { geometry in
-                            Color.clear.preference(
-                                key: ConversationViewportBottomPreferenceKey.self,
-                                value: geometry.frame(in: .global).maxY
-                            )
-                        }
+                        ScrollViewBehaviorConfigurator(
+                            onAtBottomChange: { atBottom in
+                                if isConversationAtBottom != atBottom {
+                                    isConversationAtBottom = atBottom
+                                }
+                            }
+                        )
                     )
-                    .background(ScrollViewAutoHideConfigurator())
-                    .onPreferenceChange(ConversationViewportBottomPreferenceKey.self) { value in
-                        conversationViewportBottomY = value
-                        updateConversationBottomState()
-                    }
-                    .onPreferenceChange(ConversationContentBottomPreferenceKey.self) { value in
-                        conversationContentBottomY = value
-                        updateConversationBottomState()
-                    }
                     .onAppear {
                         scrollConversationToBottom(scrollProxy, animated: false)
                     }
@@ -3914,22 +3883,26 @@ struct ContentView: View {
                             scrollConversationToBottom(scrollProxy, animated: true)
                         }
                     }
-                    .overlay(alignment: .bottomTrailing) {
+                    .overlay(alignment: .bottom) {
                         if shouldShowJumpToBottom {
                             Button {
                                 scrollConversationToBottom(scrollProxy, animated: true)
                             } label: {
-                                Image(systemName: "arrow.down.circle.fill")
-                                    .font(.system(size: 30, weight: .semibold))
-                                    .foregroundColor(.accentColor)
+                                Image(systemName: "arrow.down")
+                                    .font(.system(size: 16, weight: .bold))
+                                    .foregroundColor(Color.white.opacity(0.96))
+                                    .frame(width: 34, height: 34)
                                     .background(
                                         Circle()
-                                            .fill(Color(nsColor: .windowBackgroundColor).opacity(0.94))
-                                            .frame(width: 32, height: 32)
+                                            .fill(Color.white.opacity(0.18))
                                     )
+                                    .overlay(
+                                        Circle()
+                                            .stroke(Color.white.opacity(0.36), lineWidth: 1)
+                                    )
+                                    .shadow(color: .black.opacity(0.24), radius: 5, x: 0, y: 2)
                             }
                             .buttonStyle(.plain)
-                            .padding(.trailing, 14)
                             .padding(.bottom, 12)
                         }
                     }
@@ -4039,6 +4012,7 @@ struct ContentView: View {
                     .foregroundColor(isAdded ? .green : .red)
                 Text(lineText)
                     .font(.system(size: 12, weight: .regular, design: .monospaced))
+                    .foregroundColor(isAdded ? .green : .red)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(.horizontal, 8)
@@ -4053,34 +4027,98 @@ struct ContentView: View {
     }
 }
 
-private struct ConversationViewportBottomPreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
+private struct ScrollViewBehaviorConfigurator: NSViewRepresentable {
+    let onAtBottomChange: (Bool) -> Void
+    var threshold: CGFloat = 20
 
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
     }
-}
 
-private struct ConversationContentBottomPreferenceKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = nextValue()
-    }
-}
-
-private struct ScrollViewAutoHideConfigurator: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         NSView(frame: .zero)
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        DispatchQueue.main.async {
-            guard let scrollView = nsView.enclosingScrollView else { return }
+        context.coordinator.bind(
+            hostView: nsView,
+            threshold: threshold,
+            onAtBottomChange: onAtBottomChange
+        )
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.unbind()
+    }
+
+    final class Coordinator: NSObject {
+        private weak var observedClipView: NSClipView?
+        private weak var observedDocumentView: NSView?
+        private var onAtBottomChange: ((Bool) -> Void)?
+        private var threshold: CGFloat = 20
+
+        func bind(hostView: NSView, threshold: CGFloat, onAtBottomChange: @escaping (Bool) -> Void) {
+            self.threshold = threshold
+            self.onAtBottomChange = onAtBottomChange
+
+            guard let scrollView = hostView.enclosingScrollView else { return }
             scrollView.autohidesScrollers = true
             scrollView.scrollerStyle = .overlay
             scrollView.hasVerticalScroller = true
             scrollView.hasHorizontalScroller = false
+
+            let clipView = scrollView.contentView
+            let documentView = scrollView.documentView
+            if observedClipView !== clipView || observedDocumentView !== documentView {
+                unbind()
+                observedClipView = clipView
+                observedDocumentView = documentView
+
+                clipView.postsBoundsChangedNotifications = true
+                documentView?.postsFrameChangedNotifications = true
+
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(clipBoundsChanged),
+                    name: NSView.boundsDidChangeNotification,
+                    object: clipView
+                )
+                if let documentView {
+                    NotificationCenter.default.addObserver(
+                        self,
+                        selector: #selector(documentFrameChanged),
+                        name: NSView.frameDidChangeNotification,
+                        object: documentView
+                    )
+                }
+            }
+
+            emitCurrentBottomState()
+        }
+
+        @objc private func clipBoundsChanged(_ notification: Notification) {
+            emitCurrentBottomState()
+        }
+
+        @objc private func documentFrameChanged(_ notification: Notification) {
+            emitCurrentBottomState()
+        }
+
+        private func emitCurrentBottomState() {
+            guard let documentView = observedDocumentView, let clipView = observedClipView else { return }
+            let remaining = max(0, documentView.bounds.maxY - clipView.documentVisibleRect.maxY)
+            let atBottom = remaining <= threshold
+            onAtBottomChange?(atBottom)
+        }
+
+        func unbind() {
+            NotificationCenter.default.removeObserver(self)
+            observedClipView = nil
+            observedDocumentView = nil
+        }
+
+        deinit {
+            unbind()
         }
     }
 }
@@ -4118,7 +4156,7 @@ struct MessageBubble: View {
             HStack {
                 Text(message.role.rawValue)
                     .font(.caption.weight(.semibold))
-                    .foregroundColor(roleColor)
+                    .foregroundColor(roleLabelColor)
                 Spacer()
                 Text(message.timestamp, style: .time)
                     .font(.caption2)
@@ -4193,18 +4231,29 @@ struct MessageBubble: View {
             }
         }
         .padding(10)
-        .background(roleColor.opacity(0.12))
+        .background(bubbleBackgroundColor)
         .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    private var roleColor: Color {
+    private var roleLabelColor: Color {
         switch message.role {
         case .user:
-            return .blue
+            return Color(nsColor: .secondaryLabelColor)
         case .assistant:
-            return .green
+            return Color(nsColor: .tertiaryLabelColor)
         case .system:
-            return .orange
+            return Color(nsColor: .secondaryLabelColor).opacity(0.82)
+        }
+    }
+
+    private var bubbleBackgroundColor: Color {
+        switch message.role {
+        case .user:
+            return Color(nsColor: .controlBackgroundColor).opacity(0.96)
+        case .assistant:
+            return Color(nsColor: .windowBackgroundColor).opacity(0.94)
+        case .system:
+            return Color(nsColor: .textBackgroundColor).opacity(0.92)
         }
     }
 
@@ -4255,6 +4304,7 @@ struct MessageBubble: View {
                     .foregroundColor(isAdded ? .green : .red)
                 Text(line.text.isEmpty ? " " : line.text)
                     .font(.system(size: 11, weight: .regular, design: .monospaced))
+                    .foregroundColor(isAdded ? .green : .red)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(.horizontal, 6)
