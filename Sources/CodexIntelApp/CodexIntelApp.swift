@@ -498,6 +498,7 @@ final class AppViewModel: ObservableObject {
     private var didReportStopForCurrentRun = false
     private var fallbackChangedFiles: [String] = []
     private var loginFlowOpenedBrowser = false
+    private var loginFlowSawDeviceCodePrompt = false
     private var runHeartbeatTask: Task<Void, Never>?
     private var runStartedAt: Date?
     private var lastProgressAt: Date?
@@ -1140,7 +1141,8 @@ final class AppViewModel: ObservableObject {
     }
 
     private func parseCodexAccountStatus(stdout: String, stderr: String) -> String {
-        let combined = (stdout + "\n" + stderr).trimmingCharacters(in: .whitespacesAndNewlines)
+        let combined = stripANSIEscapeCodes(from: stdout + "\n" + stderr)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         if combined.contains("__CODEX_NOT_FOUND__") {
             return "CLI not found"
         }
@@ -1167,6 +1169,7 @@ final class AppViewModel: ObservableObject {
             let codexExecutable = try await ensureCodexExecutableAvailable()
             codexAccountStatus = "Connecting..."
             loginFlowOpenedBrowser = false
+            loginFlowSawDeviceCodePrompt = false
             appendActivity("Starting browser login flow.")
 
             let output = try await executeBusyExecutableStreaming(
@@ -1180,12 +1183,13 @@ final class AppViewModel: ObservableObject {
                 }
             }
 
-            await refreshCodexAccountStatus()
-            if output.exitCode == 0, isConnectedAccountStatus(codexAccountStatus) {
+            let waitSeconds = (loginFlowOpenedBrowser || loginFlowSawDeviceCodePrompt) ? 75 : 20
+            let connected = await waitForAccountConnection(maxWaitSeconds: waitSeconds, pollIntervalSeconds: 3)
+            if connected {
                 appendActivity("ChatGPT account connected.")
                 messages.append(ChatMessage(role: .system, content: "ChatGPT account connected."))
             } else {
-                let details = conversationSafePlainEnglish(preferredFailureText(output))
+                let details = sanitizedLoginFailureDetails(preferredFailureText(output))
                 messages.append(ChatMessage(role: .system, content: "Login ended before connection was confirmed. \(details)"))
             }
         } catch {
@@ -1195,7 +1199,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func handleLoginStreamLine(source: StreamSource, line: String) {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = stripANSIEscapeCodes(from: line).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
         if let url = firstURL(in: trimmed), !loginFlowOpenedBrowser {
@@ -1207,6 +1211,11 @@ final class AppViewModel: ObservableObject {
         }
 
         let lowered = trimmed.lowercased()
+        if lowered.contains("never share this code") || lowered.contains("device code") || lowered.contains("enter code") {
+            loginFlowSawDeviceCodePrompt = true
+            appendActivity("Waiting for code confirmation in browser...")
+            return
+        }
         if lowered.contains("waiting") || lowered.contains("authorize") || lowered.contains("browser") {
             appendActivity("Waiting for browser sign-in...")
             return
@@ -1235,6 +1244,44 @@ final class AppViewModel: ObservableObject {
             return false
         }
         return true
+    }
+
+    private func waitForAccountConnection(maxWaitSeconds: Int, pollIntervalSeconds: UInt64) async -> Bool {
+        let wait = max(3, maxWaitSeconds)
+        let interval = max(1, Int(pollIntervalSeconds))
+        let attempts = max(1, wait / interval)
+
+        for attempt in 0...attempts {
+            await refreshCodexAccountStatus()
+            if isConnectedAccountStatus(codexAccountStatus) {
+                return true
+            }
+            if attempt < attempts {
+                codexAccountStatus = "Waiting for browser sign-in..."
+                try? await Task.sleep(nanoseconds: UInt64(interval) * 1_000_000_000)
+            }
+        }
+        return false
+    }
+
+    private func sanitizedLoginFailureDetails(_ raw: String) -> String {
+        let clean = stripANSIEscapeCodes(from: raw).trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowered = clean.lowercased()
+        if lowered.contains("never share this code") || lowered.contains("device code") {
+            return "Browser login started, but the app could not confirm completion yet."
+        }
+        if clean.isEmpty || clean == "(No error details)" {
+            return "Please finish sign-in in the browser, then click Refresh Account Status."
+        }
+        return conversationSafePlainEnglish(clean)
+    }
+
+    private func stripANSIEscapeCodes(from text: String) -> String {
+        text.replacingOccurrences(
+            of: #"\u{001B}\[[0-9;]*[A-Za-z]"#,
+            with: "",
+            options: .regularExpression
+        )
     }
 
     private func applyModelDefaultsFromConfig() {
