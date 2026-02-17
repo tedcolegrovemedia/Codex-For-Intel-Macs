@@ -3890,7 +3890,7 @@ struct ContentView: View {
                             } label: {
                                 Image(systemName: "arrow.down")
                                     .font(.system(size: 16, weight: .bold))
-                                    .foregroundColor(Color.white.opacity(0.96))
+                                    .foregroundColor(Color.white.opacity(0.5))
                                     .frame(width: 34, height: 34)
                                     .background(
                                         Circle()
