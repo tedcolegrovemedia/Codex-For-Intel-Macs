@@ -9,6 +9,8 @@ BIN_DIR="$APP_DIR/Contents/MacOS"
 RES_DIR="$APP_DIR/Contents/Resources"
 PLIST_PATH="$APP_DIR/Contents/Info.plist"
 BIN_PATH="$ROOT_DIR/.build/release/$PRODUCT_NAME"
+ICON_SOURCE="$ROOT_DIR/Assets/CodexIntel.icns"
+ICON_NAME="CodexIntel.icns"
 
 cd "$ROOT_DIR"
 
@@ -24,6 +26,10 @@ echo "Creating app bundle at $APP_DIR"
 rm -rf "$APP_DIR"
 mkdir -p "$BIN_DIR" "$RES_DIR"
 cp "$BIN_PATH" "$BIN_DIR/$APP_NAME"
+
+if [[ -f "$ICON_SOURCE" ]]; then
+  cp "$ICON_SOURCE" "$RES_DIR/$ICON_NAME"
+fi
 
 cat > "$PLIST_PATH" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -42,6 +48,8 @@ cat > "$PLIST_PATH" <<'PLIST'
   <string>1.0.0</string>
   <key>CFBundleExecutable</key>
   <string>CodexIntelApp</string>
+  <key>CFBundleIconFile</key>
+  <string>CodexIntel.icns</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>LSMinimumSystemVersion</key>

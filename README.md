@@ -14,6 +14,8 @@ Native macOS (SwiftUI) GUI for driving Codex from CLI on Intel Macs.
 8. Keep power-user logs hidden by default (toggle `Power User`).
 9. Keep git controls hidden by default (toggle `Setup Git`).
 10. Show current model + reasoning effort and let you switch both from the top bar.
+11. Keep conversation output user-friendly (plain-English summary, no raw code dumps).
+12. Auto-collapse long system messages in conversation (expand on demand).
 
 ## Requirements
 
@@ -49,6 +51,8 @@ cd "/Users/tedcolegrove/Desktop/Move to Dev/Dev/Codex for Intel"
 open dist/CodexIntelApp.app
 ```
 
+The build script uses `Assets/CodexIntel.icns` for the app icon.
+
 ## Codex command and session behavior
 
 The app runs Codex directly (not through a shell `codex` command) with:
@@ -72,7 +76,7 @@ If git remote/branch are not configured, git actions stay disabled, but Codex st
 - `Project` top menu contains `Open Folder`, `Locate Codex`, and `Open in VS Code`.
 - `Power User` toggle reveals command log + live activity + codex path override.
 - `Setup Git` toggle reveals git remote/branch controls and push buttons.
-- The prompt composer is multi-line and larger, and Enter sends your next chat.
+- The prompt composer is larger, inline with conversation, and Enter sends your next chat.
 
 ## Automatic setup
 

@@ -580,20 +580,21 @@ final class AppViewModel: ObservableObject {
             }
             if output.exitCode != 0 {
                 log("Codex exited with code \(output.exitCode)")
-                let errorText = preferredFailureText(output)
-                messages.append(ChatMessage(role: .assistant, content: "Codex failed (\(output.exitCode)).\n\(errorText)"))
+                let errorText = conversationSafePlainEnglish(preferredFailureText(output))
+                messages.append(ChatMessage(role: .assistant, content: "Codex failed (\(output.exitCode)). \(errorText)"))
                 appendActivity("Codex exited with code \(output.exitCode)")
                 thinkingStatus = ""
                 return
             }
-            let response = resolvedAssistantResponse(fallback: cleanOutput(output.stdout, fallback: output.stderr))
+            let rawResponse = resolvedAssistantResponse(fallback: cleanOutput(output.stdout, fallback: output.stderr))
+            let response = conversationSafePlainEnglish(rawResponse)
             messages.append(ChatMessage(role: .assistant, content: response))
             appendActivity("Codex response complete")
             thinkingStatus = ""
             await refreshChangeSummary()
         } catch {
             let text = error.localizedDescription
-            messages.append(ChatMessage(role: .assistant, content: "Error: \(text)"))
+            messages.append(ChatMessage(role: .assistant, content: conversationSafePlainEnglish("Error: \(text)")))
             log("Error: \(text)")
             appendActivity("Error: \(text)")
             thinkingStatus = ""
@@ -644,7 +645,7 @@ final class AppViewModel: ObservableObject {
             let output = try await executeBusyCommand(label: label, command: command)
 
             if includeAsAssistantMessage {
-                let response = cleanOutput(output.stdout, fallback: output.stderr)
+                let response = conversationSafePlainEnglish(cleanOutput(output.stdout, fallback: output.stderr))
                 messages.append(ChatMessage(role: .assistant, content: response))
             }
 
@@ -653,7 +654,7 @@ final class AppViewModel: ObservableObject {
             }
         } catch {
             log("Error: \(error.localizedDescription)")
-            messages.append(ChatMessage(role: .assistant, content: "Error: \(error.localizedDescription)"))
+            messages.append(ChatMessage(role: .assistant, content: conversationSafePlainEnglish("Error: \(error.localizedDescription)")))
         }
     }
 
@@ -753,6 +754,9 @@ final class AppViewModel: ObservableObject {
         Implement requested changes directly in files and run needed commands.
         Do not stop at suggestions when you can safely make the change in this workspace.
         Keep your final response concise and action-focused.
+        Final response format: plain English only for non-technical readers.
+        Do not include code blocks, diffs, file contents, or command snippets in the response.
+        Summarize what changed in a short user-friendly update.
         If a command fails, debug and retry with a concrete fix.
 
         Latest user request:
@@ -1347,6 +1351,146 @@ final class AppViewModel: ObservableObject {
         return fallback
     }
 
+    private func conversationSafePlainEnglish(_ text: String) -> String {
+        var sanitized = stripFencedCodeBlocks(from: text)
+        sanitized = stripInlineCodeMarkers(from: sanitized)
+        sanitized = stripLikelyCodeLines(from: sanitized)
+        sanitized = sanitizeMarkdown(from: sanitized)
+        sanitized = collapseBlankLines(in: sanitized).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let summary = summarizePlainEnglish(sanitized)
+        if summary.isEmpty {
+            return "Completed. I applied updates to your project and summarized the result."
+        }
+        return summary
+    }
+
+    private func stripFencedCodeBlocks(from text: String) -> String {
+        var lines: [String] = []
+        var inFence = false
+
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(rawLine)
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                inFence.toggle()
+                continue
+            }
+            if !inFence {
+                lines.append(line)
+            }
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    private func stripInlineCodeMarkers(from text: String) -> String {
+        text.replacingOccurrences(of: "`", with: "")
+    }
+
+    private func stripLikelyCodeLines(from text: String) -> String {
+        let output = text.split(separator: "\n", omittingEmptySubsequences: false).filter { rawLine in
+            let line = String(rawLine)
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { return true }
+            if isLikelyCodeLine(trimmed) { return false }
+            return true
+        }
+        return output.map(String.init).joined(separator: "\n")
+    }
+
+    private func isLikelyCodeLine(_ trimmed: String) -> Bool {
+        if trimmed.hasPrefix("diff --git") || trimmed.hasPrefix("@@") { return true }
+        if trimmed.hasPrefix("+++ ") || trimmed.hasPrefix("--- ") { return true }
+        if trimmed.hasPrefix("{") || trimmed.hasPrefix("}") { return true }
+        if trimmed.hasPrefix("$ ") || trimmed.hasPrefix("> ") { return true }
+        if trimmed.hasPrefix("func ") || trimmed.hasPrefix("class ") || trimmed.hasPrefix("struct ") { return true }
+        if trimmed.hasPrefix("import ") || trimmed.hasPrefix("return ") || trimmed.hasPrefix("let ") || trimmed.hasPrefix("var ") { return true }
+        if trimmed.hasPrefix("#include") || trimmed.hasPrefix("public ") || trimmed.hasPrefix("private ") { return true }
+        if trimmed.contains("=>") || trimmed.contains("::") { return true }
+        if trimmed.contains("{") && trimmed.contains("}") { return true }
+        if trimmed.contains("(") && trimmed.contains(")") && trimmed.contains("{") { return true }
+        if trimmed.contains(";") { return true }
+
+        let punctuationCount = trimmed.filter { "{}[]();=<>".contains($0) }.count
+        if punctuationCount >= 5 { return true }
+        return false
+    }
+
+    private func sanitizeMarkdown(from text: String) -> String {
+        let cleaned = text.split(separator: "\n", omittingEmptySubsequences: false).map { rawLine in
+            sanitizeMarkdownLine(String(rawLine))
+        }
+        return cleaned.joined(separator: "\n")
+    }
+
+    private func sanitizeMarkdownLine(_ line: String) -> String {
+        var value = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty { return "" }
+
+        value = value.replacingOccurrences(
+            of: "^[-*+]\\s+",
+            with: "",
+            options: .regularExpression
+        )
+        value = value.replacingOccurrences(
+            of: "^\\d+\\.\\s+",
+            with: "",
+            options: .regularExpression
+        )
+        value = value.replacingOccurrences(
+            of: "^#{1,6}\\s*",
+            with: "",
+            options: .regularExpression
+        )
+        return value
+    }
+
+    private func summarizePlainEnglish(_ text: String) -> String {
+        let compact = text.replacingOccurrences(
+            of: "\\s+",
+            with: " ",
+            options: .regularExpression
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !compact.isEmpty else { return "" }
+
+        let sentenceCandidates = compact.replacingOccurrences(
+            of: "(?<=[.!?])\\s+",
+            with: "\n",
+            options: .regularExpression
+        ).split(separator: "\n").map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+
+        let proseSentences = sentenceCandidates.filter { sentence in
+            guard !sentence.isEmpty else { return false }
+            if isLikelyCodeLine(sentence) { return false }
+            return true
+        }
+
+        let summarySource = proseSentences.isEmpty ? [compact] : proseSentences
+        let summary = summarySource.prefix(4).joined(separator: " ")
+        if summary.count <= 420 {
+            return summary
+        }
+        return String(summary.prefix(420)).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
+    }
+
+    private func collapseBlankLines(in text: String) -> String {
+        var lines: [String] = []
+        var previousBlank = false
+
+        for rawLine in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(rawLine)
+            let blank = line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            if blank && previousBlank {
+                continue
+            }
+            lines.append(line)
+            previousBlank = blank
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
     private func extractAssistantTextSegments(from value: Any) -> [String] {
         if let text = value as? String {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1830,58 +1974,62 @@ struct ContentView: View {
             .padding(.horizontal, 16)
             .padding(.top, 14)
 
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
-                    ForEach(viewModel.messages) { message in
-                        MessageBubble(message: message)
+            VStack(spacing: 0) {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(viewModel.messages) { message in
+                            MessageBubble(message: message)
+                        }
+                    }
+                    .padding(16)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                VStack(spacing: 10) {
+                    HStack(spacing: 8) {
+                        if viewModel.isBusy {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Text(inlineStatusText)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .lineLimit(2)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
+                    HStack(alignment: .bottom, spacing: 12) {
+                        TextField(
+                            "Ask Codex to edit files, run commands, or implement features...",
+                            text: $viewModel.draftPrompt,
+                            axis: .vertical
+                        )
+                        .lineLimit(6...14)
+                        .frame(minHeight: 110, alignment: .topLeading)
+                        .padding(10)
+                        .background(Color(nsColor: .windowBackgroundColor))
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .disabled(viewModel.isBusy)
+                        .onSubmit {
+                            viewModel.sendPrompt()
+                        }
+
+                        Button {
+                            viewModel.sendPrompt()
+                        } label: {
+                            Image(systemName: "arrow.up.circle.fill")
+                                .font(.system(size: 32))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(sendDisabled ? .gray : .accentColor)
+                        .disabled(sendDisabled)
                     }
                 }
-                .padding(16)
+                .padding(12)
+                .background(Color(nsColor: .controlBackgroundColor))
             }
             .background(Color(nsColor: .textBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 10))
-            .padding(.horizontal, 16)
-
-            HStack(spacing: 8) {
-                if viewModel.isBusy {
-                    ProgressView()
-                        .controlSize(.small)
-                }
-                Text(inlineStatusText)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(Color(nsColor: .controlBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .padding(.horizontal, 16)
-
-            HStack(alignment: .bottom, spacing: 10) {
-                TextField(
-                    "Ask Codex to edit files, run commands, or implement features...",
-                    text: $viewModel.draftPrompt,
-                    axis: .vertical
-                )
-                .lineLimit(5...12)
-                .textFieldStyle(.roundedBorder)
-                .disabled(viewModel.isBusy)
-                .onSubmit {
-                    viewModel.sendPrompt()
-                }
-
-                Button {
-                    viewModel.sendPrompt()
-                } label: {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 30))
-                }
-                .buttonStyle(.plain)
-                .foregroundColor(sendDisabled ? .gray : .accentColor)
-                .disabled(sendDisabled)
-            }
             .padding(.horizontal, 16)
             .padding(.bottom, 16)
         }
@@ -1890,6 +2038,7 @@ struct ContentView: View {
 
 struct MessageBubble: View {
     let message: ChatMessage
+    @State private var expanded = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1902,10 +2051,20 @@ struct MessageBubble: View {
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }
-            Text(message.content)
+            Text(displayContent)
                 .font(.body)
                 .textSelection(.enabled)
+                .lineLimit(shouldCollapse ? 2 : nil)
                 .frame(maxWidth: .infinity, alignment: .leading)
+
+            if canCollapse {
+                Button(expanded ? "Show less" : "Show details") {
+                    expanded.toggle()
+                }
+                .buttonStyle(.plain)
+                .font(.caption2.weight(.semibold))
+                .foregroundColor(.secondary)
+            }
         }
         .padding(10)
         .background(roleColor.opacity(0.12))
@@ -1921,5 +2080,25 @@ struct MessageBubble: View {
         case .system:
             return .orange
         }
+    }
+
+    private var canCollapse: Bool {
+        message.role == .system &&
+            message.content.split(separator: "\n", omittingEmptySubsequences: false).count > 2
+    }
+
+    private var shouldCollapse: Bool {
+        canCollapse && !expanded
+    }
+
+    private var displayContent: String {
+        guard shouldCollapse else { return message.content }
+        let collapsed = message.content
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .prefix(2)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return collapsed.isEmpty ? message.content : collapsed
     }
 }
