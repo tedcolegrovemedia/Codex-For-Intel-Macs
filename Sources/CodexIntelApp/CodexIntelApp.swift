@@ -412,6 +412,7 @@ final class AppViewModel: ObservableObject {
     private var modelEffortsBySlug: [String: [String]] = [:]
     private var currentRunAssistantDeltas = ""
     private var currentRunAssistantCompletions: [String] = []
+    private var detectedStaleSessionErrorInCurrentRun = false
 
     init() {
         applyModelDefaultsFromConfig()
@@ -569,7 +570,7 @@ final class AppViewModel: ObservableObject {
             appendActivity("Running autonomous Codex turn")
 
             let codexArguments = buildCodexTurnArguments(prompt: prompt)
-            let output = try await executeBusyExecutableStreaming(
+            var output = try await executeBusyExecutableStreaming(
                 label: "Running Codex",
                 executablePath: codexExecutable,
                 arguments: codexArguments
@@ -578,6 +579,26 @@ final class AppViewModel: ObservableObject {
                     self?.handleCodexStreamLine(source: source, line: line)
                 }
             }
+
+            if output.exitCode != 0 && shouldRetryWithFreshSession(output) {
+                log("Detected stale Codex session state. Retrying with a fresh session.")
+                appendActivity("Session state stale. Retrying with a fresh session.")
+                resetSession(reason: "Recovered from stale session state.")
+                resetAssistantCapture()
+                detectedStaleSessionErrorInCurrentRun = false
+                thinkingStatus = "Retrying..."
+
+                output = try await executeBusyExecutableStreaming(
+                    label: "Running Codex (retry)",
+                    executablePath: codexExecutable,
+                    arguments: buildCodexExecArguments(prompt: prompt)
+                ) { [weak self] source, line in
+                    Task { @MainActor in
+                        self?.handleCodexStreamLine(source: source, line: line)
+                    }
+                }
+            }
+
             if output.exitCode != 0 {
                 log("Codex exited with code \(output.exitCode)")
                 let errorText = conversationSafePlainEnglish(preferredFailureText(output))
@@ -1209,6 +1230,7 @@ final class AppViewModel: ObservableObject {
         latestDiffFiles.removeAll()
         latestDiffLines.removeAll()
         showChangesAccordion = false
+        detectedStaleSessionErrorInCurrentRun = false
     }
 
     private func appendActivity(_ value: String) {
@@ -1227,6 +1249,10 @@ final class AppViewModel: ObservableObject {
         guard let event = parseCodexJSONEvent(from: trimmed) else {
             if source == .stderr {
                 log("[codex] \(trimmed)")
+                if isStaleSessionStateError(trimmed) {
+                    detectedStaleSessionErrorInCurrentRun = true
+                    appendActivity("Detected stale Codex session state.")
+                }
                 if trimmed.contains("WARN") || trimmed.contains("Error") || trimmed.contains("error") {
                     appendActivity(trimmed)
                 }
@@ -1330,6 +1356,24 @@ final class AppViewModel: ObservableObject {
             return "Turn event: \(type)"
         }
         return nil
+    }
+
+    private func isStaleSessionStateError(_ text: String) -> Bool {
+        let lowered = text.lowercased()
+        if lowered.contains("missing rollout path for thread") {
+            return true
+        }
+        if lowered.contains("state db"), lowered.contains("missing rollout"), lowered.contains("thread") {
+            return true
+        }
+        return false
+    }
+
+    private func shouldRetryWithFreshSession(_ output: CommandOutput) -> Bool {
+        if detectedStaleSessionErrorInCurrentRun {
+            return true
+        }
+        return isStaleSessionStateError(output.stderr + "\n" + output.stdout)
     }
 
     private func resetAssistantCapture() {
