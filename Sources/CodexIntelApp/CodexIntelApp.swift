@@ -138,6 +138,9 @@ enum AutoPushOutcome {
 }
 
 struct ShellRunner {
+    private static let processLock = NSLock()
+    private static var activeProcesses: [ObjectIdentifier: Process] = [:]
+
     func run(
         command: String,
         workingDirectory: String?,
@@ -156,6 +159,16 @@ struct ShellRunner {
                     continuation.resume(throwing: error)
                 }
             }
+        }
+    }
+
+    func stopActiveProcesses() {
+        ShellRunner.processLock.lock()
+        let processes = Array(ShellRunner.activeProcesses.values)
+        ShellRunner.processLock.unlock()
+
+        for process in processes where process.isRunning {
+            process.terminate()
         }
     }
 
@@ -282,7 +295,9 @@ struct ShellRunner {
         process.standardError = stderrHandle
 
         try process.run()
+        track(process)
         process.waitUntilExit()
+        untrack(process)
 
         let stdout = (try? String(contentsOf: stdoutURL, encoding: .utf8)) ?? ""
         let stderr = (try? String(contentsOf: stderrURL, encoding: .utf8)) ?? ""
@@ -349,7 +364,9 @@ struct ShellRunner {
         }
 
         try process.run()
+        track(process)
         process.waitUntilExit()
+        untrack(process)
 
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
         stderrPipe.fileHandleForReading.readabilityHandler = nil
@@ -375,6 +392,18 @@ struct ShellRunner {
         let output = CommandOutput(stdout: stdoutText, stderr: stderrText, exitCode: process.terminationStatus)
         lock.unlock()
         return output
+    }
+
+    private static func track(_ process: Process) {
+        processLock.lock()
+        activeProcesses[ObjectIdentifier(process)] = process
+        processLock.unlock()
+    }
+
+    private static func untrack(_ process: Process) {
+        processLock.lock()
+        activeProcesses.removeValue(forKey: ObjectIdentifier(process))
+        processLock.unlock()
     }
 
     private static func enrichedEnvironment(extraPathDirectories: [String] = []) -> [String: String] {
@@ -458,6 +487,8 @@ final class AppViewModel: ObservableObject {
     private var currentRunAssistantDeltas = ""
     private var currentRunAssistantCompletions: [String] = []
     private var detectedStaleSessionErrorInCurrentRun = false
+    private var stopRequested = false
+    private var didReportStopForCurrentRun = false
     private let genericDoneFallback = "Completed. I applied updates to your project and summarized the result."
 
     init() {
@@ -561,6 +592,14 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    func stopActiveRun() {
+        guard isBusy else { return }
+        stopRequested = true
+        thinkingStatus = "Stopping..."
+        appendActivity("Stop requested by user.")
+        runner.stopActiveProcesses()
+    }
+
     func openInVSCode() {
         Task {
             await runUtilityCommand(
@@ -624,13 +663,16 @@ final class AppViewModel: ObservableObject {
     private func runCodex(for userPrompt: String) async {
         resetRunFeedback()
         resetAssistantCapture()
+        stopRequested = false
         let runStartedAt = Date()
 
         do {
             try validateProjectAndTemplate(prompt: userPrompt)
             let codexExecutable = try await ensureCodexExecutableAvailable()
             await ensureProjectDirectoryTrustAndAccess()
+            if finalizeStopIfNeeded() { return }
             await startPersistentAutonomousSessionIfNeeded(executablePath: codexExecutable)
+            if finalizeStopIfNeeded() { return }
 
             resetAssistantCapture()
             let prompt = buildPromptWithHistory(newPrompt: userPrompt)
@@ -647,6 +689,7 @@ final class AppViewModel: ObservableObject {
                     self?.handleCodexStreamLine(source: source, line: line)
                 }
             }
+            if finalizeStopIfNeeded() { return }
 
             if output.exitCode != 0 && shouldRetryWithFreshSession(output) {
                 log("Detected stale Codex session state. Retrying with a fresh session.")
@@ -665,6 +708,7 @@ final class AppViewModel: ObservableObject {
                         self?.handleCodexStreamLine(source: source, line: line)
                     }
                 }
+                if finalizeStopIfNeeded() { return }
             }
 
             if output.exitCode != 0 {
@@ -680,9 +724,12 @@ final class AppViewModel: ObservableObject {
             appendActivity("Codex response complete")
             thinkingStatus = ""
             await refreshChangeSummary()
+            if finalizeStopIfNeeded() { return }
             let doneSummary = resolvedDoneSummary(responseSummary)
             let validation = await runAutomaticValidationIfPossible()
+            if finalizeStopIfNeeded() { return }
             let pushOutcome = await autoCommitAndPushAfterChat()
+            if finalizeStopIfNeeded() { return }
             let summary = buildPostRunSummary(
                 doneSummary: doneSummary,
                 duration: Date().timeIntervalSince(runStartedAt),
@@ -691,6 +738,7 @@ final class AppViewModel: ObservableObject {
             )
             messages.append(ChatMessage(role: .assistant, content: summary))
         } catch {
+            if finalizeStopIfNeeded() { return }
             let text = error.localizedDescription
             messages.append(ChatMessage(role: .assistant, content: conversationSafePlainEnglish("Error: \(text)")))
             log("Error: \(text)")
@@ -1576,6 +1624,18 @@ final class AppViewModel: ObservableObject {
         latestDiffLines.removeAll()
         showChangesAccordion = false
         detectedStaleSessionErrorInCurrentRun = false
+        didReportStopForCurrentRun = false
+    }
+
+    private func finalizeStopIfNeeded() -> Bool {
+        guard stopRequested else { return false }
+        guard !didReportStopForCurrentRun else { return true }
+        didReportStopForCurrentRun = true
+        stopRequested = false
+        thinkingStatus = ""
+        appendActivity("Run stopped.")
+        messages.append(ChatMessage(role: .assistant, content: "Stopped. I halted the current run and skipped remaining steps."))
+        return true
     }
 
     private func appendActivity(_ value: String) {
@@ -2575,6 +2635,18 @@ struct ContentView: View {
             viewModel.draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    private var composerActionIconName: String {
+        viewModel.isBusy ? "stop.circle.fill" : "arrow.up.circle.fill"
+    }
+
+    private var composerActionColor: Color {
+        viewModel.isBusy ? .red : (sendDisabled ? .gray : .accentColor)
+    }
+
+    private var composerActionDisabled: Bool {
+        viewModel.isBusy ? false : sendDisabled
+    }
+
     private var inlineStatusText: String {
         if viewModel.isBusy {
             return viewModel.thinkingStatus.isEmpty ? viewModel.busyLabel : viewModel.thinkingStatus
@@ -2648,14 +2720,18 @@ struct ContentView: View {
                         }
 
                         Button {
-                            viewModel.sendPrompt()
+                            if viewModel.isBusy {
+                                viewModel.stopActiveRun()
+                            } else {
+                                viewModel.sendPrompt()
+                            }
                         } label: {
-                            Image(systemName: "arrow.up.circle.fill")
+                            Image(systemName: composerActionIconName)
                                 .font(.system(size: 32))
                         }
                         .buttonStyle(.plain)
-                        .foregroundColor(sendDisabled ? .gray : .accentColor)
-                        .disabled(sendDisabled)
+                        .foregroundColor(composerActionColor)
+                        .disabled(composerActionDisabled)
                     }
                 }
                 .padding(12)
