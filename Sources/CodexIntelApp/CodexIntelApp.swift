@@ -115,6 +115,11 @@ struct ValidationPlan {
     let successMessage: String
 }
 
+struct GitRunSnapshot {
+    let isGitWorkspace: Bool
+    let startHeadCommit: String?
+}
+
 enum AutoPushOutcome {
     case pushed(commitShortSHA: String?, remoteDisplay: String, branch: String)
     case failed(String)
@@ -674,6 +679,7 @@ final class AppViewModel: ObservableObject {
 
         do {
             try validateProjectAndTemplate(prompt: userPrompt)
+            let gitSnapshot = await captureGitRunSnapshot()
             let codexExecutable = try await ensureCodexExecutableAvailable()
             await ensureProjectDirectoryTrustAndAccess()
             if finalizeStopIfNeeded() { return }
@@ -731,7 +737,10 @@ final class AppViewModel: ObservableObject {
             thinkingStatus = ""
             await refreshChangeSummary()
             if latestDiffFiles.isEmpty {
-                captureFilesystemChangeFallback(since: runStartedAt)
+                let restored = await refreshChangeSummaryFromCommittedRange(snapshot: gitSnapshot)
+                if !restored {
+                    captureFilesystemChangeFallback(since: runStartedAt)
+                }
             }
             if finalizeStopIfNeeded() { return }
             let doneSummary = resolvedDoneSummary(responseSummary)
@@ -2293,6 +2302,57 @@ final class AppViewModel: ObservableObject {
         fallbackChangedFiles = Array(Set(found)).sorted()
         if !fallbackChangedFiles.isEmpty {
             appendActivity("Filesystem fallback detected \(fallbackChangedFiles.count) changed file(s).")
+        }
+    }
+
+    private func captureGitRunSnapshot() async -> GitRunSnapshot {
+        guard await isGitWorkspace() else {
+            return GitRunSnapshot(isGitWorkspace: false, startHeadCommit: nil)
+        }
+        let head = await currentGitHeadCommit()
+        return GitRunSnapshot(isGitWorkspace: true, startHeadCommit: head)
+    }
+
+    private func currentGitHeadCommit() async -> String? {
+        guard !projectPath.isEmpty else { return nil }
+        guard let output = try? await runner.run(
+            command: "git rev-parse HEAD",
+            workingDirectory: projectPath
+        ) else { return nil }
+        guard output.exitCode == 0 else { return nil }
+        let commit = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return commit.isEmpty ? nil : commit
+    }
+
+    private func refreshChangeSummaryFromCommittedRange(snapshot: GitRunSnapshot) async -> Bool {
+        guard snapshot.isGitWorkspace else { return false }
+        guard let start = snapshot.startHeadCommit, !start.isEmpty else { return false }
+        guard let end = await currentGitHeadCommit(), !end.isEmpty else { return false }
+        guard start != end else { return false }
+
+        do {
+            let numstatOutput = try await runner.run(
+                command: "git diff --numstat --no-renames \(shellQuote(start))..\(shellQuote(end))",
+                workingDirectory: projectPath
+            )
+            let patchOutput = try await runner.run(
+                command: "git diff --no-color --unified=0 --no-renames \(shellQuote(start))..\(shellQuote(end))",
+                workingDirectory: projectPath
+            )
+            guard numstatOutput.exitCode == 0, patchOutput.exitCode == 0 else { return false }
+
+            let files = parseNumstat(numstatOutput.stdout).sorted { $0.path < $1.path }
+            guard !files.isEmpty else { return false }
+
+            latestDiffFiles = files
+            latestDiffAdded = files.reduce(0) { $0 + $1.added }
+            latestDiffRemoved = files.reduce(0) { $0 + $1.removed }
+            latestDiffLines = parseDiffLines(patchOutput.stdout, limit: 200)
+            appendActivity("Detected committed changes: +\(latestDiffAdded) / -\(latestDiffRemoved) across \(files.count) file(s).")
+            return true
+        } catch {
+            log("Unable to derive committed range changes: \(error.localizedDescription)")
+            return false
         }
     }
 
