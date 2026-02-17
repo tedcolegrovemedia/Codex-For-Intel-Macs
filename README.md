@@ -60,7 +60,9 @@ If git remote/branch are not configured, Codex is invoked with `--skip-git-repo-
 
 ## Automatic setup
 
-When a project folder is selected, the app attempts to install everything needed via Homebrew:
+Every time a project folder is selected, the app automatically:
+- verifies trust/read-write access for that folder (`chmod u+rwx`, read/write probe, and `git safe.directory` best-effort)
+- attempts to install everything needed via Homebrew:
 - Homebrew (if missing)
 - `git`
 - `ripgrep`

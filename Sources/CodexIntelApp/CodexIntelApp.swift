@@ -43,7 +43,7 @@ enum ViewModelError: LocalizedError {
         case .emptyPrompt:
             return "Prompt is empty."
         case .codexNotFound:
-            return "Codex CLI not found. Use Setup Dependencies or set Codex Path in the app."
+            return "Codex CLI not found. Select a project folder to trigger automatic setup, or set Codex Path in the app."
         }
     }
 }
@@ -211,7 +211,6 @@ final class AppViewModel: ObservableObject {
     private let runner = ShellRunner()
     private var resolvedCodexExecutable: String?
     private var didAttemptAutoInstallCodex = false
-    private var didCompleteDependencySetup = false
     private let missingBrewMarker = "__BREW_MISSING__"
     var isGitConfigured: Bool {
         !gitRemote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
@@ -230,10 +229,8 @@ final class AppViewModel: ObservableObject {
             projectPath = url.path
             log("Selected project: \(projectPath)")
             Task {
-                await ensureProjectDirectoryAccess()
-                if !didCompleteDependencySetup {
-                    await runDependencyInstaller(autoTriggered: true)
-                }
+                await ensureProjectDirectoryTrustAndAccess()
+                await runDependencyInstaller(autoTriggered: true)
             }
         }
     }
@@ -307,13 +304,9 @@ final class AppViewModel: ObservableObject {
         do {
             try validateProjectAndTemplate(prompt: userPrompt)
             let codexExecutable = try await ensureCodexExecutableAvailable()
-            await ensureProjectDirectoryAccess()
+            await ensureProjectDirectoryTrustAndAccess()
             let enrichedPrompt = buildPromptWithHistory(newPrompt: userPrompt)
-            var codexArguments: [String] = ["exec"]
-            if !isGitConfigured {
-                codexArguments.append("--skip-git-repo-check")
-            }
-            codexArguments.append(enrichedPrompt)
+            let codexArguments: [String] = ["exec", "--skip-git-repo-check", enrichedPrompt]
             let output = try await executeBusyExecutable(
                 label: "Running Codex",
                 executablePath: codexExecutable,
@@ -600,15 +593,28 @@ final class AppViewModel: ObservableObject {
         return (remote, branch)
     }
 
-    private func ensureProjectDirectoryAccess() async {
+    private func ensureProjectDirectoryTrustAndAccess() async {
         let path = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !path.isEmpty else { return }
-        let output = try? await runner.run(
-            command: "chmod u+rwx \(shellQuote(path))",
-            workingDirectory: nil
-        )
-        if let output, output.exitCode == 0 {
-            log("Ensured directory permissions for project.")
+        let probeFile = "\(path)/.codexintelapp_rw_probe"
+        let command = """
+        chmod u+rwx \(shellQuote(path)) &&
+        test -r \(shellQuote(path)) &&
+        test -w \(shellQuote(path)) &&
+        touch \(shellQuote(probeFile)) &&
+        rm -f \(shellQuote(probeFile)) &&
+        if command -v git >/dev/null 2>&1; then git config --global --add safe.directory \(shellQuote(path)) || true; fi
+        """
+        guard let output = try? await runner.run(command: command, workingDirectory: nil) else {
+            log("Unable to verify project directory trust/read-write access.")
+            return
+        }
+        if output.exitCode == 0 {
+            log("Project directory trust/read-write verified.")
+        } else {
+            let details = preferredFailureText(output)
+            log("Project directory access verification failed (\(output.exitCode)): \(details)")
+            messages.append(ChatMessage(role: .system, content: "Project directory access check failed (\(output.exitCode)).\n\(details)"))
         }
     }
 
@@ -631,7 +637,6 @@ final class AppViewModel: ObservableObject {
                 log("Dependency setup failed with code \(output.exitCode): \(details)")
                 return
             }
-            didCompleteDependencySetup = true
             resolvedCodexExecutable = nil
             let details = cleanOutput(output.stdout, fallback: output.stderr)
             let completionMessage = autoTriggered
@@ -697,7 +702,7 @@ final class AppViewModel: ObservableObject {
         messages.append(
             ChatMessage(
                 role: .system,
-                content: "Homebrew is required to auto-install Codex CLI. I opened brew.sh. Install Homebrew, then retry Setup Dependencies or send the chat again."
+                content: "Homebrew is required to auto-install Codex CLI. I opened brew.sh. Install Homebrew, then re-select the project folder or send the chat again."
             )
         )
     }
