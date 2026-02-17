@@ -2048,6 +2048,7 @@ struct ContentView: View {
                             text: $viewModel.draftPrompt,
                             axis: .vertical
                         )
+                        .textFieldStyle(.plain)
                         .lineLimit(6...14)
                         .frame(minHeight: 110, alignment: .topLeading)
                         .padding(10)
