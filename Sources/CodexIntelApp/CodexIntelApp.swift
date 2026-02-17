@@ -1670,6 +1670,13 @@ final class AppViewModel: ObservableObject {
             lines.append("• \(value)")
         }
 
+        let detailedChanges = detailedChangeReferenceLines(fileLimit: 4, lineLimit: 4)
+        if !detailedChanges.isEmpty {
+            lines.append("")
+            lines.append("Detailed changes:")
+            lines.append(contentsOf: detailedChanges)
+        }
+
         lines.append("")
         lines.append("Validation:")
         lines.append("• \(validation.summaryLine)")
@@ -1713,6 +1720,36 @@ final class AppViewModel: ObservableObject {
         return values
     }
 
+    private func detailedChangeReferenceLines(fileLimit: Int, lineLimit: Int) -> [String] {
+        guard !latestDiffFiles.isEmpty else {
+            return fallbackDetailedChangeReferenceLines(limit: fileLimit)
+        }
+
+        var values: [String] = []
+        for file in latestDiffFiles.prefix(fileLimit) {
+            let compactPath = compactSummaryPath(file.path)
+            values.append("• \(compactPath) (\(diffStatText(added: file.added, removed: file.removed)))")
+
+            let linePreview = latestDiffLines
+                .filter { $0.file == file.path }
+                .prefix(lineLimit)
+
+            if linePreview.isEmpty {
+                values.append("  line preview unavailable")
+            } else {
+                for line in linePreview {
+                    values.append("  \(formattedDetailedDiffLine(line))")
+                }
+            }
+        }
+
+        let remaining = latestDiffFiles.count - values.filter { $0.hasPrefix("• ") }.count
+        if remaining > 0 {
+            values.append("• +\(remaining) more file(s)")
+        }
+        return values
+    }
+
     private func fallbackChangedReferenceLines(limit: Int) -> [String] {
         guard !fallbackChangedFiles.isEmpty else {
             return ["No file edits were detected in this run."]
@@ -1727,6 +1764,38 @@ final class AppViewModel: ObservableObject {
             values.append("+\(remaining) more file(s)")
         }
         return values
+    }
+
+    private func fallbackDetailedChangeReferenceLines(limit: Int) -> [String] {
+        guard !fallbackChangedFiles.isEmpty else { return [] }
+        var values = fallbackChangedFiles.prefix(limit).map { "• \(compactSummaryPath($0)) (changed)" }
+        let remaining = fallbackChangedFiles.count - values.count
+        if remaining > 0 {
+            values.append("• +\(remaining) more file(s)")
+        }
+        return values
+    }
+
+    private func formattedDetailedDiffLine(_ line: DiffLine) -> String {
+        let sign = line.kind == .added ? "+" : "-"
+        let preview = summarizedDiffPreviewText(line.text)
+        if let lineNumber = line.lineNumber {
+            return "\(sign) L\(lineNumber): \(preview)"
+        }
+        return "\(sign): \(preview)"
+    }
+
+    private func summarizedDiffPreviewText(_ text: String, maxLength: Int = 120) -> String {
+        var value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty {
+            return "(blank line)"
+        }
+        value = value.replacingOccurrences(of: "\t", with: " ")
+        value = value.replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
+        if value.count > maxLength {
+            return String(value.prefix(maxLength)) + "..."
+        }
+        return value
     }
 
     private func resolvedDoneSummary(_ summary: String) -> String {
