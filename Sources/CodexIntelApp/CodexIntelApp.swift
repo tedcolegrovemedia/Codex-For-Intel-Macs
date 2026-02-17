@@ -1232,7 +1232,26 @@ final class AppViewModel: ObservableObject {
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         guard let match = regex.firstMatch(in: text, options: [], range: range) else { return nil }
         guard let matchRange = Range(match.range, in: text) else { return nil }
-        return URL(string: String(text[matchRange]))
+        let raw = String(text[matchRange])
+        let cleaned = sanitizeCapturedURLString(raw)
+        guard !cleaned.isEmpty else { return nil }
+        return URL(string: cleaned)
+    }
+
+    private func sanitizeCapturedURLString(_ raw: String) -> String {
+        var candidate = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        candidate = candidate.replacingOccurrences(
+            of: #"(?i)%1b%5b[0-9;]*[a-z]"#,
+            with: "",
+            options: .regularExpression
+        )
+        candidate = candidate.replacingOccurrences(
+            of: #"(?i)\\u001b\[[0-9;]*[a-z]"#,
+            with: "",
+            options: .regularExpression
+        )
+        candidate = candidate.trimmingCharacters(in: CharacterSet(charactersIn: ".,;:!?"))
+        return candidate
     }
 
     private func isConnectedAccountStatus(_ status: String) -> Bool {
