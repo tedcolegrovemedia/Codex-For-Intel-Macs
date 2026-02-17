@@ -3402,6 +3402,10 @@ final class AppViewModel: ObservableObject {
 struct ContentView: View {
     @StateObject private var viewModel = AppViewModel()
     @State private var collapsedChangeFiles: Set<String> = []
+    @State private var conversationViewportBottomY: CGFloat = 0
+    @State private var conversationContentBottomY: CGFloat = 0
+    @State private var isConversationAtBottom = true
+    private let conversationBottomAnchorID = "conversation-bottom-anchor"
 
     var body: some View {
         VStack(spacing: 0) {
@@ -3823,6 +3827,30 @@ struct ContentView: View {
             .lowercased()
     }
 
+    private var shouldShowJumpToBottom: Bool {
+        !isConversationAtBottom && !viewModel.messages.isEmpty
+    }
+
+    private func updateConversationBottomState() {
+        let threshold: CGFloat = 24
+        let distance = conversationContentBottomY - conversationViewportBottomY
+        isConversationAtBottom = distance <= threshold
+    }
+
+    private func scrollConversationToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
+        isConversationAtBottom = true
+        let action = {
+            proxy.scrollTo(conversationBottomAnchorID, anchor: .bottom)
+        }
+        if animated {
+            withAnimation(.easeOut(duration: 0.18)) {
+                action()
+            }
+        } else {
+            action()
+        }
+    }
+
     private var conversationPanel: some View {
         VStack(spacing: 12) {
             HStack {
@@ -3834,18 +3862,77 @@ struct ContentView: View {
             .padding(.top, 14)
 
             VStack(spacing: 0) {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 12) {
-                        ForEach(viewModel.messages) { message in
-                            let inline = inlineChangeData(for: message)
-                            MessageBubble(
-                                message: message,
-                                inlineDiffFiles: inline.files,
-                                inlineDiffLines: inline.lines
+                ScrollViewReader { scrollProxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 12) {
+                            ForEach(viewModel.messages) { message in
+                                let inline = inlineChangeData(for: message)
+                                MessageBubble(
+                                    message: message,
+                                    inlineDiffFiles: inline.files,
+                                    inlineDiffLines: inline.lines
+                                )
+                            }
+
+                            Color.clear
+                                .frame(height: 1)
+                                .id(conversationBottomAnchorID)
+                                .background(
+                                    GeometryReader { geometry in
+                                        Color.clear.preference(
+                                            key: ConversationContentBottomPreferenceKey.self,
+                                            value: geometry.frame(in: .global).maxY
+                                        )
+                                    }
+                                )
+                        }
+                        .padding(16)
+                    }
+                    .background(
+                        GeometryReader { geometry in
+                            Color.clear.preference(
+                                key: ConversationViewportBottomPreferenceKey.self,
+                                value: geometry.frame(in: .global).maxY
                             )
                         }
+                    )
+                    .background(ScrollViewAutoHideConfigurator())
+                    .onPreferenceChange(ConversationViewportBottomPreferenceKey.self) { value in
+                        conversationViewportBottomY = value
+                        updateConversationBottomState()
                     }
-                    .padding(16)
+                    .onPreferenceChange(ConversationContentBottomPreferenceKey.self) { value in
+                        conversationContentBottomY = value
+                        updateConversationBottomState()
+                    }
+                    .onAppear {
+                        scrollConversationToBottom(scrollProxy, animated: false)
+                    }
+                    .onChange(of: viewModel.messages.last?.id) { _ in
+                        guard let lastMessage = viewModel.messages.last else { return }
+                        if lastMessage.role != .user {
+                            scrollConversationToBottom(scrollProxy, animated: true)
+                        }
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                        if shouldShowJumpToBottom {
+                            Button {
+                                scrollConversationToBottom(scrollProxy, animated: true)
+                            } label: {
+                                Image(systemName: "arrow.down.circle.fill")
+                                    .font(.system(size: 30, weight: .semibold))
+                                    .foregroundColor(.accentColor)
+                                    .background(
+                                        Circle()
+                                            .fill(Color(nsColor: .windowBackgroundColor).opacity(0.94))
+                                            .frame(width: 32, height: 32)
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.trailing, 14)
+                            .padding(.bottom, 12)
+                        }
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -3962,6 +4049,38 @@ struct ContentView: View {
             Rectangle()
                 .fill((isAdded ? Color.green : Color.red).opacity(0.95))
                 .frame(width: 3)
+        }
+    }
+}
+
+private struct ConversationViewportBottomPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct ConversationContentBottomPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct ScrollViewAutoHideConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        NSView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        DispatchQueue.main.async {
+            guard let scrollView = nsView.enclosingScrollView else { return }
+            scrollView.autohidesScrollers = true
+            scrollView.scrollerStyle = .overlay
+            scrollView.hasVerticalScroller = true
+            scrollView.hasHorizontalScroller = false
         }
     }
 }
