@@ -516,6 +516,8 @@ final class AppViewModel: ObservableObject {
     private var preRunTextSnapshots: [String: String] = [:]
     private var loginFlowOpenedBrowser = false
     private var loginFlowSawDeviceCodePrompt = false
+    private var loginFlowNeedsDeviceAuthEnablement = false
+    private var loginFlowOpenedSecuritySettings = false
     private var runHeartbeatTask: Task<Void, Never>?
     private var runStartedAt: Date?
     private var lastProgressAt: Date?
@@ -523,6 +525,7 @@ final class AppViewModel: ObservableObject {
     private let recentProjectsDefaultsKey = "CodexIntelAppRecentProjects"
     private let maxRecentProjectsCount = 12
     private let maxPersistedConversationMessages = 400
+    private let codexSecuritySettingsURL = "https://chatgpt.com/#settings/Security"
     private var suppressConversationPersistence = false
 
     init() {
@@ -1315,6 +1318,8 @@ final class AppViewModel: ObservableObject {
             codexAccountStatus = "Connecting..."
             loginFlowOpenedBrowser = false
             loginFlowSawDeviceCodePrompt = false
+            loginFlowNeedsDeviceAuthEnablement = false
+            loginFlowOpenedSecuritySettings = false
             appendActivity("Starting browser login flow.")
 
             let output = try await executeBusyExecutableStreaming(
@@ -1326,6 +1331,19 @@ final class AppViewModel: ObservableObject {
                 Task { @MainActor in
                     self?.handleLoginStreamLine(source: source, line: line)
                 }
+            }
+
+            if loginFlowNeedsDeviceAuthEnablement || indicatesDeviceAuthEnablementRequired(output.stdout + "\n" + output.stderr) {
+                loginFlowNeedsDeviceAuthEnablement = true
+                openSecuritySettingsForDeviceAuthIfNeeded(sourceLine: output.stdout + "\n" + output.stderr)
+                codexAccountStatus = "Enable device auth in ChatGPT Security Settings"
+                messages.append(
+                    ChatMessage(
+                        role: .system,
+                        content: "Device code authorization for Codex is disabled. I opened ChatGPT Security Settings. Enable device code authorization, then click Connect ChatGPT Account again."
+                    )
+                )
+                return
             }
 
             let waitSeconds = (loginFlowOpenedBrowser || loginFlowSawDeviceCodePrompt) ? 75 : 20
@@ -1346,6 +1364,13 @@ final class AppViewModel: ObservableObject {
     private func handleLoginStreamLine(source: StreamSource, line: String) {
         let trimmed = stripANSIEscapeCodes(from: line).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        if indicatesDeviceAuthEnablementRequired(trimmed) {
+            loginFlowNeedsDeviceAuthEnablement = true
+            codexAccountStatus = "Enable device auth in ChatGPT Security Settings"
+            openSecuritySettingsForDeviceAuthIfNeeded(sourceLine: trimmed)
+            appendActivity("Device code authorization is disabled in ChatGPT Security Settings.")
+            return
+        }
 
         if let url = firstURL(in: trimmed), !loginFlowOpenedBrowser {
             openBrowserForLogin(url)
@@ -1424,11 +1449,33 @@ final class AppViewModel: ObservableObject {
         openBrowserForLogin(url)
     }
 
+    private func openSecuritySettingsForDeviceAuthIfNeeded(sourceLine: String? = nil) {
+        guard !loginFlowOpenedSecuritySettings else { return }
+        let candidate = sourceLine.flatMap { firstURL(in: $0) }
+        let fallback = URL(string: codexSecuritySettingsURL)
+        guard let url = candidate ?? fallback else { return }
+
+        loginFlowOpenedSecuritySettings = true
+        NSWorkspace.shared.open(url)
+        appendActivity("Opened ChatGPT Security Settings.")
+    }
+
     private func openBrowserForLogin(_ url: URL) {
         loginFlowOpenedBrowser = true
         NSWorkspace.shared.open(url)
         codexAccountStatus = "Waiting for browser sign-in..."
         appendActivity("Opened browser sign-in page.")
+    }
+
+    private func indicatesDeviceAuthEnablementRequired(_ text: String) -> Bool {
+        let lowered = stripANSIEscapeCodes(from: text).lowercased()
+        if lowered.contains("enable device code authorization") {
+            return true
+        }
+        if lowered.contains("device code") && lowered.contains("security settings") {
+            return true
+        }
+        return false
     }
 
     private func isConnectedAccountStatus(_ status: String) -> Bool {
@@ -1447,11 +1494,17 @@ final class AppViewModel: ObservableObject {
     }
 
     private func waitForAccountConnection(maxWaitSeconds: Int, pollIntervalSeconds: UInt64) async -> Bool {
+        if loginFlowNeedsDeviceAuthEnablement {
+            return false
+        }
         let wait = max(3, maxWaitSeconds)
         let interval = max(1, Int(pollIntervalSeconds))
         let attempts = max(1, wait / interval)
 
         for attempt in 0...attempts {
+            if loginFlowNeedsDeviceAuthEnablement {
+                return false
+            }
             await refreshCodexAccountStatus()
             if isConnectedAccountStatus(codexAccountStatus) {
                 return true
@@ -1467,6 +1520,9 @@ final class AppViewModel: ObservableObject {
     private func sanitizedLoginFailureDetails(_ raw: String) -> String {
         let clean = stripANSIEscapeCodes(from: raw).trimmingCharacters(in: .whitespacesAndNewlines)
         let lowered = clean.lowercased()
+        if indicatesDeviceAuthEnablementRequired(clean) {
+            return "Enable device code authorization for Codex in ChatGPT Security Settings, then click Connect ChatGPT Account again."
+        }
         if lowered.contains("not connected") || lowered.contains("not logged") || lowered.contains("login required") {
             return "Browser login did not complete. Please finish sign-in in the browser window and try again."
         }
@@ -1503,11 +1559,17 @@ final class AppViewModel: ObservableObject {
     }
 
     private func stripANSIEscapeCodes(from text: String) -> String {
-        text.replacingOccurrences(
+        var value = text.replacingOccurrences(
             of: #"\u{001B}\[[0-9;]*[A-Za-z]"#,
             with: "",
             options: .regularExpression
         )
+        value = value.replacingOccurrences(
+            of: #"\u{001B}\][^\u{0007}\u{001B}]*(?:\u{0007}|\u{001B}\\)"#,
+            with: "",
+            options: .regularExpression
+        )
+        return value
     }
 
     private func applyModelDefaultsFromConfig() {
