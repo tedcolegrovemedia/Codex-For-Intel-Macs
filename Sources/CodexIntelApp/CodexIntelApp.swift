@@ -2362,12 +2362,15 @@ final class AppViewModel: ObservableObject {
 
         guard let event = parseCodexJSONEvent(from: trimmed) else {
             if source == .stderr {
-                log("[codex] \(trimmed)")
-                if isStaleSessionStateError(trimmed) {
+                let staleState = isStaleSessionStateError(trimmed)
+                if staleState {
                     detectedStaleSessionErrorInCurrentRun = true
                     appendActivity("Detected stale Codex session state.")
+                    log("[codex] stale session state detected; retrying with a fresh session")
+                } else {
+                    log("[codex] \(trimmed)")
                 }
-                if trimmed.contains("WARN") || trimmed.contains("Error") || trimmed.contains("error") {
+                if !staleState && (trimmed.contains("WARN") || trimmed.contains("Error") || trimmed.contains("error")) {
                     appendActivity(trimmed)
                 }
             }
@@ -2868,9 +2871,9 @@ final class AppViewModel: ObservableObject {
 
         var fileCount = 0
         var capturedBytes = 0
-        let maxFiles = 450
-        let maxTotalBytes = 6_000_000
-        let maxFileBytes = 180_000
+        let maxFiles = 500
+        let maxTotalBytes = 18_000_000
+        let maxFileBytes = 900_000
 
         while let fileURL = enumerator.nextObject() as? URL {
             guard fileCount < maxFiles else { break }
@@ -2890,7 +2893,7 @@ final class AppViewModel: ObservableObject {
             guard !relativePath.isEmpty else { continue }
             guard !excludedPrefixes.contains(where: { relativePath.hasPrefix($0) }) else { continue }
 
-            guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
+            guard let text = readFileTextLossy(at: fileURL) else { continue }
 
             preRunTextSnapshots[relativePath] = text
             fileCount += 1
@@ -2941,7 +2944,7 @@ final class AppViewModel: ObservableObject {
 
         let beforeText = preRunTextSnapshots[relativePath] ?? ""
         let fileURL = URL(fileURLWithPath: rootPath, isDirectory: true).appendingPathComponent(relativePath)
-        let afterText = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
+        let afterText = readFileTextLossy(at: fileURL) ?? ""
 
         if beforeText == afterText {
             return nil
@@ -2968,14 +2971,95 @@ final class AppViewModel: ObservableObject {
             patchText = patchText.replacingOccurrences(of: "b\(newURL.path)", with: "b/\(relativePath)")
 
             let fullLines = parseDiffLines(patchText, limit: 8_000).filter { $0.file == relativePath }
-            let added = fullLines.filter { $0.kind == .added }.count
-            let removed = fullLines.filter { $0.kind == .removed }.count
-            let preview = Array(fullLines.prefix(80))
+            if !fullLines.isEmpty {
+                let added = fullLines.filter { $0.kind == .added }.count
+                let removed = fullLines.filter { $0.kind == .removed }.count
+                let preview = Array(fullLines.prefix(80))
+                return (added: added, removed: removed, lines: preview)
+            }
 
-            return (added: added, removed: removed, lines: preview)
+            return deriveSimpleLineDiff(beforeText: beforeText, afterText: afterText, file: relativePath, previewLimit: 80)
         } catch {
+            return deriveSimpleLineDiff(beforeText: beforeText, afterText: afterText, file: relativePath, previewLimit: 80)
+        }
+    }
+
+    private func deriveSimpleLineDiff(
+        beforeText: String,
+        afterText: String,
+        file: String,
+        previewLimit: Int
+    ) -> (added: Int, removed: Int, lines: [DiffLine])? {
+        let beforeLines = beforeText.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let afterLines = afterText.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+
+        var prefix = 0
+        while prefix < beforeLines.count && prefix < afterLines.count && beforeLines[prefix] == afterLines[prefix] {
+            prefix += 1
+        }
+
+        var suffix = 0
+        while suffix < beforeLines.count - prefix &&
+                suffix < afterLines.count - prefix &&
+                beforeLines[beforeLines.count - 1 - suffix] == afterLines[afterLines.count - 1 - suffix] {
+            suffix += 1
+        }
+
+        let removedStart = prefix
+        let removedEnd = max(prefix, beforeLines.count - suffix)
+        let addedStart = prefix
+        let addedEnd = max(prefix, afterLines.count - suffix)
+
+        let removedCount = max(0, removedEnd - removedStart)
+        let addedCount = max(0, addedEnd - addedStart)
+
+        if removedCount == 0 && addedCount == 0 {
             return nil
         }
+
+        var lines: [DiffLine] = []
+        for index in removedStart..<min(removedEnd, removedStart + previewLimit) {
+            lines.append(
+                DiffLine(
+                    file: file,
+                    kind: .removed,
+                    lineNumber: index + 1,
+                    text: beforeLines[index]
+                )
+            )
+        }
+
+        let remaining = max(0, previewLimit - lines.count)
+        if remaining > 0 {
+            for index in addedStart..<min(addedEnd, addedStart + remaining) {
+                lines.append(
+                    DiffLine(
+                        file: file,
+                        kind: .added,
+                        lineNumber: index + 1,
+                        text: afterLines[index]
+                    )
+                )
+            }
+        }
+
+        return (added: addedCount, removed: removedCount, lines: lines)
+    }
+
+    private func readFileTextLossy(at url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        if !isLikelyText(data) {
+            return nil
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func isLikelyText(_ data: Data) -> Bool {
+        if data.isEmpty { return true }
+        let sampleSize = min(4096, data.count)
+        let sample = data.prefix(sampleSize)
+        let nulCount = sample.filter { $0 == 0 }.count
+        return nulCount == 0
     }
 
     private func captureGitRunSnapshot() async -> GitRunSnapshot {
