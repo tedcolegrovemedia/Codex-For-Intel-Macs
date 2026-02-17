@@ -109,6 +109,12 @@ enum ValidationOutcome {
     }
 }
 
+struct ValidationPlan {
+    let label: String
+    let command: String
+    let successMessage: String
+}
+
 enum AutoPushOutcome {
     case pushed(commitShortSHA: String?, remoteDisplay: String, branch: String)
     case failed(String)
@@ -444,6 +450,7 @@ final class AppViewModel: ObservableObject {
     private var resolvedCodexExecutable: String?
     private var didAttemptAutoInstallCodex = false
     private let missingBrewMarker = "__BREW_MISSING__"
+    private let missingValidatorRuntimeMarker = "__VALIDATOR_RUNTIME_MISSING__"
     private var activeSessionID: String?
     private var sessionBootInProgress = false
     private var modelEffortsBySlug: [String: [String]] = [:]
@@ -1185,27 +1192,108 @@ final class AppViewModel: ObservableObject {
             return .skipped("Validation skipped: no project folder selected.")
         }
 
-        let packageManifest = URL(fileURLWithPath: project, isDirectory: true)
-            .appendingPathComponent("Package.swift")
-            .path
-        guard FileManager.default.fileExists(atPath: packageManifest) else {
+        guard let plan = selectValidationPlan(for: project) else {
             return .skipped("Validation skipped: no automatic validator configured for this project type.")
         }
 
-        appendActivity("Running validation: swift build")
+        appendActivity("Running validation: \(plan.label)")
         do {
-            let output = try await executeBusyCommand(label: "Validation: swift build", command: "swift build")
+            let output = try await executeBusyCommand(label: "Validation: \(plan.label)", command: plan.command)
             if output.exitCode == 0 {
-                appendActivity("Validation passed: swift build")
-                return .passed("swift build passed.")
+                appendActivity("Validation passed: \(plan.label)")
+                return .passed(plan.successMessage)
+            }
+            if validatorRuntimeMissing(output) {
+                appendActivity("Validation skipped: runtime unavailable for \(plan.label)")
+                return .skipped("Validation skipped: required runtime for \(plan.label) is not installed.")
             }
             let details = conversationSafePlainEnglish(preferredFailureText(output))
-            appendActivity("Validation failed: swift build (\(output.exitCode))")
-            return .failed("swift build failed (\(output.exitCode)). \(details)")
+            appendActivity("Validation failed: \(plan.label) (\(output.exitCode))")
+            return .failed("\(plan.label) failed (\(output.exitCode)). \(details)")
         } catch {
             appendActivity("Validation error: \(error.localizedDescription)")
-            return .failed("swift build failed to run: \(conversationSafePlainEnglish(error.localizedDescription))")
+            return .failed("\(plan.label) failed to run: \(conversationSafePlainEnglish(error.localizedDescription))")
         }
+    }
+
+    private func selectValidationPlan(for project: String) -> ValidationPlan? {
+        let root = URL(fileURLWithPath: project, isDirectory: true)
+        let fileManager = FileManager.default
+
+        let packageManifest = root.appendingPathComponent("Package.swift").path
+        if fileManager.fileExists(atPath: packageManifest) {
+            return ValidationPlan(
+                label: "swift build",
+                command: "swift build",
+                successMessage: "swift build passed."
+            )
+        }
+
+        let packageJSON = root.appendingPathComponent("package.json").path
+        if fileManager.fileExists(atPath: packageJSON) {
+            let scripts = npmScriptNames(from: packageJSON)
+            if scripts.contains("lint") {
+                return ValidationPlan(
+                    label: "npm run lint",
+                    command: "if command -v npm >/dev/null 2>&1; then npm run -s lint; else echo \"\(missingValidatorRuntimeMarker):npm\"; exit 86; fi",
+                    successMessage: "npm run lint passed."
+                )
+            }
+            if scripts.contains("typecheck") {
+                return ValidationPlan(
+                    label: "npm run typecheck",
+                    command: "if command -v npm >/dev/null 2>&1; then npm run -s typecheck; else echo \"\(missingValidatorRuntimeMarker):npm\"; exit 86; fi",
+                    successMessage: "npm run typecheck passed."
+                )
+            }
+            if scripts.contains("check") {
+                return ValidationPlan(
+                    label: "npm run check",
+                    command: "if command -v npm >/dev/null 2>&1; then npm run -s check; else echo \"\(missingValidatorRuntimeMarker):npm\"; exit 86; fi",
+                    successMessage: "npm run check passed."
+                )
+            }
+            if scripts.contains("build") {
+                return ValidationPlan(
+                    label: "npm run build",
+                    command: "if command -v npm >/dev/null 2>&1; then npm run -s build; else echo \"\(missingValidatorRuntimeMarker):npm\"; exit 86; fi",
+                    successMessage: "npm run build passed."
+                )
+            }
+        }
+
+        let pyproject = root.appendingPathComponent("pyproject.toml").path
+        let requirements = root.appendingPathComponent("requirements.txt").path
+        if fileManager.fileExists(atPath: pyproject) || fileManager.fileExists(atPath: requirements) {
+            return ValidationPlan(
+                label: "python compile check",
+                command: "if command -v python3 >/dev/null 2>&1; then python3 -m compileall -q .; else echo \"\(missingValidatorRuntimeMarker):python3\"; exit 86; fi",
+                successMessage: "python compile check passed."
+            )
+        }
+
+        return nil
+    }
+
+    private func npmScriptNames(from packageJSONPath: String) -> Set<String> {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: packageJSONPath)) else {
+            return []
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+        if let scripts = object["scripts"] as? [String: String] {
+            return Set(scripts.keys)
+        }
+        if let scripts = object["scripts"] as? [String: Any] {
+            return Set(scripts.keys)
+        }
+        return []
+    }
+
+    private func validatorRuntimeMissing(_ output: CommandOutput) -> Bool {
+        let combined = output.stdout + "\n" + output.stderr
+        return combined.contains(missingValidatorRuntimeMarker)
     }
 
     private func buildPostRunSummary(
