@@ -463,6 +463,8 @@ final class AppViewModel: ObservableObject {
     @Published var codexCliVersion = "Detecting..."
     @Published var codexAccountStatus = "Checking..."
     @Published var codexSessionState = "Not started"
+    @Published var loginDeviceCode: String?
+    @Published var loginVerificationURL = "https://auth.openai.com/codex/device"
     @Published var recentProjects: [String] = []
     @Published var selectedModel = "gpt-5.3-codex"
     @Published var selectedReasoningEffort = "xhigh"
@@ -526,6 +528,7 @@ final class AppViewModel: ObservableObject {
     private let maxRecentProjectsCount = 12
     private let maxPersistedConversationMessages = 400
     private let codexSecuritySettingsURL = "https://chatgpt.com/#settings/Security"
+    private let defaultCodexDeviceAuthURL = "https://auth.openai.com/codex/device"
     private var suppressConversationPersistence = false
 
     init() {
@@ -816,6 +819,19 @@ final class AppViewModel: ObservableObject {
         Task {
             await runInAppBrowserLoginFlow()
         }
+    }
+
+    func copyLoginDeviceCode() {
+        guard let code = loginDeviceCode, !code.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(code, forType: .string)
+        appendActivity("Copied device code to clipboard.")
+    }
+
+    func openLoginVerificationPage() {
+        let value = loginVerificationURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: value.isEmpty ? defaultCodexDeviceAuthURL : value) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     func refreshAccountStatus() {
@@ -1320,6 +1336,8 @@ final class AppViewModel: ObservableObject {
             loginFlowSawDeviceCodePrompt = false
             loginFlowNeedsDeviceAuthEnablement = false
             loginFlowOpenedSecuritySettings = false
+            loginDeviceCode = nil
+            loginVerificationURL = defaultCodexDeviceAuthURL
             appendActivity("Starting browser login flow.")
 
             let output = try await executeBusyExecutableStreaming(
@@ -1335,6 +1353,7 @@ final class AppViewModel: ObservableObject {
 
             if loginFlowNeedsDeviceAuthEnablement || indicatesDeviceAuthEnablementRequired(output.stdout + "\n" + output.stderr) {
                 loginFlowNeedsDeviceAuthEnablement = true
+                loginDeviceCode = nil
                 openSecuritySettingsForDeviceAuthIfNeeded(sourceLine: output.stdout + "\n" + output.stderr)
                 codexAccountStatus = "Enable device auth in ChatGPT Security Settings"
                 messages.append(
@@ -1351,6 +1370,7 @@ final class AppViewModel: ObservableObject {
             if connected {
                 appendActivity("ChatGPT account connected.")
                 messages.append(ChatMessage(role: .system, content: "ChatGPT account connected."))
+                loginDeviceCode = nil
             } else {
                 let details = sanitizedLoginFailureDetails(preferredFailureText(output) + "\n" + codexAccountStatus)
                 messages.append(ChatMessage(role: .system, content: "Login ended before connection was confirmed. \(details)"))
@@ -1364,16 +1384,27 @@ final class AppViewModel: ObservableObject {
     private func handleLoginStreamLine(source: StreamSource, line: String) {
         let trimmed = stripANSIEscapeCodes(from: line).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+
+        if let verificationURL = firstURL(in: trimmed) {
+            loginVerificationURL = verificationURL.absoluteString
+            if !loginFlowOpenedBrowser {
+                openBrowserForLogin(verificationURL)
+                return
+            }
+        }
+
+        if let code = extractDeviceCode(from: trimmed) {
+            loginDeviceCode = code
+            loginFlowSawDeviceCodePrompt = true
+            appendActivity("Device code is ready to copy.")
+        }
+
         if indicatesDeviceAuthEnablementRequired(trimmed) {
             loginFlowNeedsDeviceAuthEnablement = true
+            loginDeviceCode = nil
             codexAccountStatus = "Enable device auth in ChatGPT Security Settings"
             openSecuritySettingsForDeviceAuthIfNeeded(sourceLine: trimmed)
             appendActivity("Device code authorization is disabled in ChatGPT Security Settings.")
-            return
-        }
-
-        if let url = firstURL(in: trimmed), !loginFlowOpenedBrowser {
-            openBrowserForLogin(url)
             return
         }
 
@@ -1443,9 +1474,19 @@ final class AppViewModel: ObservableObject {
         return components.url
     }
 
+    private func extractDeviceCode(from text: String) -> String? {
+        let pattern = #"(?i:(?:device(?:\s+code)?|user(?:\s+code)?|code)\s*[:\-]?\s*)([A-Z0-9]{3,}(?:-[A-Z0-9]{3,})+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range) else { return nil }
+        guard let codeRange = Range(match.range(at: 1), in: text) else { return nil }
+        let code = String(text[codeRange]).uppercased()
+        return code.isEmpty ? nil : code
+    }
+
     private func openCanonicalDeviceAuthURLIfNeeded() {
         guard !loginFlowOpenedBrowser else { return }
-        guard let url = URL(string: "https://auth.openai.com/codex/device") else { return }
+        guard let url = URL(string: defaultCodexDeviceAuthURL) else { return }
         openBrowserForLogin(url)
     }
 
@@ -1462,6 +1503,7 @@ final class AppViewModel: ObservableObject {
 
     private func openBrowserForLogin(_ url: URL) {
         loginFlowOpenedBrowser = true
+        loginVerificationURL = canonicalizedLoginURL(from: url.absoluteString)?.absoluteString ?? url.absoluteString
         NSWorkspace.shared.open(url)
         codexAccountStatus = "Waiting for browser sign-in..."
         appendActivity("Opened browser sign-in page.")
@@ -3801,6 +3843,11 @@ struct ContentView: View {
         viewModel.messages.last(where: { $0.role == .assistant })?.id
     }
 
+    private var hasVisibleLoginDeviceCode: Bool {
+        guard let code = viewModel.loginDeviceCode else { return false }
+        return !code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     private func inlineChangeData(for message: ChatMessage) -> (files: [DiffFileStat], lines: [DiffLine]) {
         guard message.role == .assistant else { return ([], []) }
         guard message.id == latestAssistantMessageID else { return ([], []) }
@@ -3920,6 +3967,43 @@ struct ContentView: View {
                             .foregroundColor(.secondary)
                             .lineLimit(2)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
+                    if hasVisibleLoginDeviceCode {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Device Code")
+                                .font(.caption.weight(.semibold))
+                                .foregroundColor(.secondary)
+
+                            HStack(spacing: 8) {
+                                Text(viewModel.loginDeviceCode ?? "")
+                                    .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                                    .textSelection(.enabled)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(Color(nsColor: .windowBackgroundColor))
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                                Spacer(minLength: 0)
+                                Button("Copy Code") {
+                                    viewModel.copyLoginDeviceCode()
+                                }
+                                .buttonStyle(.plain)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(Color(nsColor: .windowBackgroundColor))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                            }
+
+                            Button("Open Verification Page") {
+                                viewModel.openLoginVerificationPage()
+                            }
+                            .buttonStyle(.plain)
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(.secondary)
+                        }
+                        .padding(10)
+                        .background(Color(nsColor: .textBackgroundColor).opacity(0.92))
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
                     }
 
                     if viewModel.isBusy, !visibleThinkingHighlights.isEmpty {
