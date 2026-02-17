@@ -52,6 +52,7 @@ struct DiffLine: Identifiable {
     let id = UUID()
     let file: String
     let kind: DiffLineKind
+    let lineNumber: Int?
     let text: String
 }
 
@@ -90,6 +91,41 @@ enum ViewModelError: LocalizedError {
             return "Prompt is empty."
         case .codexNotFound:
             return "Codex CLI not found. Select a project folder to trigger automatic setup, or set Codex Path in the app."
+        }
+    }
+}
+
+enum ValidationOutcome {
+    case passed(String)
+    case failed(String)
+    case skipped(String)
+
+    var summaryLine: String {
+        switch self {
+        case .passed(let text), .failed(let text), .skipped(let text):
+            return text
+        }
+    }
+}
+
+enum AutoPushOutcome {
+    case pushed(commitShortSHA: String?, remoteDisplay: String, branch: String)
+    case failed(String)
+    case skipped(String)
+
+    var summaryLines: [String] {
+        switch self {
+        case .pushed(let commitShortSHA, let remoteDisplay, let branch):
+            var lines: [String] = []
+            if let commitShortSHA, !commitShortSHA.isEmpty {
+                lines.append("Commit \(commitShortSHA)")
+            }
+            lines.append("\(branch) updated on \(remoteDisplay)")
+            return lines
+        case .failed(let text):
+            return [text]
+        case .skipped(let text):
+            return [text]
         }
     }
 }
@@ -557,6 +593,7 @@ final class AppViewModel: ObservableObject {
     private func runCodex(for userPrompt: String) async {
         resetRunFeedback()
         resetAssistantCapture()
+        let runStartedAt = Date()
 
         do {
             try validateProjectAndTemplate(prompt: userPrompt)
@@ -608,19 +645,27 @@ final class AppViewModel: ObservableObject {
                 return
             }
             let rawResponse = resolvedAssistantResponse(fallback: cleanOutput(output.stdout, fallback: output.stderr))
-            let response = conversationSafePlainEnglish(rawResponse)
-            messages.append(ChatMessage(role: .assistant, content: response))
+            let responseSummary = conversationSafePlainEnglish(rawResponse)
             appendActivity("Codex response complete")
             thinkingStatus = ""
             await refreshChangeSummary()
+            let validation = await runAutomaticValidationIfPossible()
+            let pushOutcome = await autoCommitAndPushAfterChat()
+            let summary = buildPostRunSummary(
+                doneSummary: responseSummary,
+                duration: Date().timeIntervalSince(runStartedAt),
+                validation: validation,
+                push: pushOutcome
+            )
+            messages.append(ChatMessage(role: .assistant, content: summary))
         } catch {
             let text = error.localizedDescription
             messages.append(ChatMessage(role: .assistant, content: conversationSafePlainEnglish("Error: \(text)")))
             log("Error: \(text)")
             appendActivity("Error: \(text)")
             thinkingStatus = ""
+            _ = await autoCommitAndPushAfterChat()
         }
-        await autoCommitAndPushAfterChat()
     }
 
     private func ensureCodexExecutableAvailable() async throws -> String {
@@ -1075,11 +1120,17 @@ final class AppViewModel: ObservableObject {
         throw ViewModelError.codexNotFound
     }
 
-    private func autoCommitAndPushAfterChat() async {
-        guard isGitConfigured else { return }
+    private func autoCommitAndPushAfterChat() async -> AutoPushOutcome {
+        guard isGitConfigured else {
+            return .skipped("Git not configured.")
+        }
         let project = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !project.isEmpty else { return }
-        guard let target = configuredGitTarget() else { return }
+        guard !project.isEmpty else {
+            return .skipped("No project folder selected for git push.")
+        }
+        guard let target = configuredGitTarget() else {
+            return .skipped("Git remote/branch not configured.")
+        }
 
         let commit = commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "Update via CodexIntelApp"
@@ -1091,14 +1142,140 @@ final class AppViewModel: ObservableObject {
             if output.exitCode != 0 {
                 let details = cleanOutput(output.stdout, fallback: output.stderr)
                 log("Auto push failed with code \(output.exitCode): \(details)")
-                messages.append(ChatMessage(role: .system, content: "Auto push failed: \(details)"))
-            } else {
-                log("Auto push completed for \(target.remote)/\(target.branch).")
+                return .failed("Auto push failed (\(output.exitCode)): \(conversationSafePlainEnglish(details))")
             }
+
+            let commitShortSHA = await currentShortCommitSHA()
+            let remoteDisplay = await resolveRemoteDisplayName(remote: target.remote)
+            log("Auto push completed for \(target.remote)/\(target.branch).")
+            return .pushed(commitShortSHA: commitShortSHA, remoteDisplay: remoteDisplay, branch: target.branch)
         } catch {
             log("Auto push error: \(error.localizedDescription)")
-            messages.append(ChatMessage(role: .system, content: "Auto push error: \(error.localizedDescription)"))
+            return .failed("Auto push error: \(conversationSafePlainEnglish(error.localizedDescription))")
         }
+    }
+
+    private func runAutomaticValidationIfPossible() async -> ValidationOutcome {
+        let project = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !project.isEmpty else {
+            return .skipped("Validation skipped: no project folder selected.")
+        }
+
+        let packageManifest = URL(fileURLWithPath: project, isDirectory: true)
+            .appendingPathComponent("Package.swift")
+            .path
+        guard FileManager.default.fileExists(atPath: packageManifest) else {
+            return .skipped("Validation skipped: no automatic validator configured for this project type.")
+        }
+
+        appendActivity("Running validation: swift build")
+        do {
+            let output = try await executeBusyCommand(label: "Validation: swift build", command: "swift build")
+            if output.exitCode == 0 {
+                appendActivity("Validation passed: swift build")
+                return .passed("swift build passed.")
+            }
+            let details = conversationSafePlainEnglish(preferredFailureText(output))
+            appendActivity("Validation failed: swift build (\(output.exitCode))")
+            return .failed("swift build failed (\(output.exitCode)). \(details)")
+        } catch {
+            appendActivity("Validation error: \(error.localizedDescription)")
+            return .failed("swift build failed to run: \(conversationSafePlainEnglish(error.localizedDescription))")
+        }
+    }
+
+    private func buildPostRunSummary(
+        doneSummary: String,
+        duration: TimeInterval,
+        validation: ValidationOutcome,
+        push: AutoPushOutcome
+    ) -> String {
+        var lines: [String] = []
+        lines.append("Worked for \(formattedElapsedDuration(duration))")
+        lines.append("")
+        lines.append("Done. \(doneSummary)")
+
+        let changedFiles = changedFileReferenceLines(limit: 6)
+        if !changedFiles.isEmpty {
+            lines.append("")
+            for value in changedFiles {
+                lines.append("• \(value)")
+            }
+        }
+
+        lines.append("")
+        lines.append("Validation:")
+        lines.append("• \(validation.summaryLine)")
+
+        lines.append("")
+        lines.append("Pushed:")
+        for line in push.summaryLines {
+            lines.append("• \(line)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func changedFileReferenceLines(limit: Int) -> [String] {
+        guard !latestDiffFiles.isEmpty else { return [] }
+
+        var firstLineByFile: [String: Int] = [:]
+        for line in latestDiffLines {
+            guard let lineNumber = line.lineNumber else { continue }
+            if firstLineByFile[line.file] == nil {
+                firstLineByFile[line.file] = lineNumber
+            }
+        }
+
+        var values: [String] = []
+        for file in latestDiffFiles.prefix(limit) {
+            if let line = firstLineByFile[file.path] {
+                values.append("\(file.path) (line \(line))")
+            } else {
+                values.append(file.path)
+            }
+        }
+
+        let remaining = latestDiffFiles.count - values.count
+        if remaining > 0 {
+            values.append("+\(remaining) more file(s)")
+        }
+        return values
+    }
+
+    private func formattedElapsedDuration(_ duration: TimeInterval) -> String {
+        let seconds = max(1, Int(duration.rounded()))
+        let minutes = seconds / 60
+        let remainder = seconds % 60
+        if minutes == 0 {
+            return "\(seconds)s"
+        }
+        if remainder == 0 {
+            return "\(minutes)m"
+        }
+        return "\(minutes)m \(remainder)s"
+    }
+
+    private func currentShortCommitSHA() async -> String? {
+        guard let output = try? await runner.run(
+            command: "git rev-parse --short HEAD",
+            workingDirectory: projectPath
+        ) else { return nil }
+        guard output.exitCode == 0 else { return nil }
+        let value = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    private func resolveRemoteDisplayName(remote: String) async -> String {
+        if remote.contains("://") || remote.contains("@") {
+            return remote
+        }
+        guard let output = try? await runner.run(
+            command: "git remote get-url \(shellQuote(remote))",
+            workingDirectory: projectPath
+        ) else { return remote }
+        guard output.exitCode == 0 else { return remote }
+        let value = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? remote : value
     }
 
     private func configuredGitTarget() -> (remote: String, branch: String)? {
@@ -1672,6 +1849,8 @@ final class AppViewModel: ObservableObject {
     private func parseDiffLines(_ diffText: String, limit: Int) -> [DiffLine] {
         var currentFile = "(unknown)"
         var lines: [DiffLine] = []
+        var oldLineCursor: Int?
+        var newLineCursor: Int?
 
         for raw in diffText.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = String(raw)
@@ -1682,20 +1861,56 @@ final class AppViewModel: ObservableObject {
                     let value = String(candidate)
                     currentFile = value.hasPrefix("b/") ? String(value.dropFirst(2)) : value
                 }
+                oldLineCursor = nil
+                newLineCursor = nil
                 continue
             }
             if line.hasPrefix("+++ b/") {
                 currentFile = String(line.dropFirst(6))
                 continue
             }
-            if line.hasPrefix("--- ") || line.hasPrefix("index ") || line.hasPrefix("@@") || line.hasPrefix("new file mode") || line.hasPrefix("deleted file mode") {
+            if line.hasPrefix("--- ") || line.hasPrefix("index ") || line.hasPrefix("new file mode") || line.hasPrefix("deleted file mode") {
+                continue
+            }
+            if line.hasPrefix("@@") {
+                if let hunk = parseDiffHunkHeader(line) {
+                    oldLineCursor = hunk.oldStart
+                    newLineCursor = hunk.newStart
+                }
                 continue
             }
 
             if line.hasPrefix("+"), !line.hasPrefix("+++") {
-                lines.append(DiffLine(file: currentFile, kind: .added, text: String(line.dropFirst())))
+                lines.append(
+                    DiffLine(
+                        file: currentFile,
+                        kind: .added,
+                        lineNumber: newLineCursor,
+                        text: String(line.dropFirst())
+                    )
+                )
+                if let value = newLineCursor {
+                    newLineCursor = value + 1
+                }
             } else if line.hasPrefix("-"), !line.hasPrefix("---") {
-                lines.append(DiffLine(file: currentFile, kind: .removed, text: String(line.dropFirst())))
+                lines.append(
+                    DiffLine(
+                        file: currentFile,
+                        kind: .removed,
+                        lineNumber: oldLineCursor,
+                        text: String(line.dropFirst())
+                    )
+                )
+                if let value = oldLineCursor {
+                    oldLineCursor = value + 1
+                }
+            } else if !line.hasPrefix("\\ No newline at end of file") {
+                if let value = oldLineCursor {
+                    oldLineCursor = value + 1
+                }
+                if let value = newLineCursor {
+                    newLineCursor = value + 1
+                }
             }
 
             if lines.count >= limit {
@@ -1704,6 +1919,22 @@ final class AppViewModel: ObservableObject {
         }
 
         return lines
+    }
+
+    private func parseDiffHunkHeader(_ line: String) -> (oldStart: Int, newStart: Int)? {
+        let pattern = "^@@ -([0-9]+)(?:,[0-9]+)? \\+([0-9]+)(?:,[0-9]+)? @@"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let fullRange = NSRange(line.startIndex..<line.endIndex, in: line)
+        guard let match = regex.firstMatch(in: line, options: [], range: fullRange) else { return nil }
+        guard
+            let oldRange = Range(match.range(at: 1), in: line),
+            let newRange = Range(match.range(at: 2), in: line),
+            let oldStart = Int(line[oldRange]),
+            let newStart = Int(line[newRange])
+        else {
+            return nil
+        }
+        return (oldStart: oldStart, newStart: newStart)
     }
 
     private func log(_ message: String) {
