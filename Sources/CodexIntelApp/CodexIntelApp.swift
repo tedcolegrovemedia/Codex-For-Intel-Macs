@@ -806,7 +806,7 @@ final class AppViewModel: ObservableObject {
             appendActivity("Codex response complete")
             thinkingStatus = ""
             await refreshChangeSummary()
-            if latestDiffFiles.isEmpty {
+            if latestDiffFiles.isEmpty || !hasMeaningfulDiffStats() {
                 let restored = await refreshChangeSummaryFromCommittedRange(snapshot: gitSnapshot)
                 if !restored {
                     captureFilesystemChangeFallback(since: runStartedAt)
@@ -1130,7 +1130,7 @@ final class AppViewModel: ObservableObject {
           echo "__CODEX_NOT_FOUND__"
           exit 0
         fi
-        codex whoami 2>/dev/null || codex auth whoami 2>/dev/null || codex auth status 2>/dev/null || true
+        codex login status 2>/dev/null || codex auth login status 2>/dev/null || codex whoami 2>/dev/null || true
         """
 
         guard let output = try? await runner.run(command: command, workingDirectory: nil) else {
@@ -1146,20 +1146,31 @@ final class AppViewModel: ObservableObject {
         if combined.contains("__CODEX_NOT_FOUND__") {
             return "CLI not found"
         }
-        let lowered = combined.lowercased()
-        if lowered.contains("not logged") || lowered.contains("unauthorized") || lowered.contains("sign in") {
-            return "Not connected"
-        }
 
-        let lines = combined
+        let rawLines = combined
             .split(separator: "\n")
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        if let first = lines.first {
-            if first.count <= 80 {
-                return first
-            }
-            return String(first.prefix(80)) + "..."
+        let lines = rawLines.filter { !isIgnorableAccountStatusLine($0) }
+        let searchable = lines.isEmpty ? rawLines : lines
+
+        let lowered = searchable.joined(separator: "\n").lowercased()
+        if lowered.contains("not logged")
+            || lowered.contains("not connected")
+            || lowered.contains("unauthorized")
+            || lowered.contains("sign in")
+            || lowered.contains("log in")
+            || lowered.contains("login required")
+        {
+            return "Not connected"
+        }
+
+        if let connectedLine = searchable.first(where: { isConnectedAccountStatusLine($0) }) {
+            return truncateStatusLine(connectedLine)
+        }
+
+        if let first = searchable.first {
+            return truncateStatusLine(first)
         }
         return "Unknown"
     }
@@ -1189,7 +1200,7 @@ final class AppViewModel: ObservableObject {
                 appendActivity("ChatGPT account connected.")
                 messages.append(ChatMessage(role: .system, content: "ChatGPT account connected."))
             } else {
-                let details = sanitizedLoginFailureDetails(preferredFailureText(output))
+                let details = sanitizedLoginFailureDetails(preferredFailureText(output) + "\n" + codexAccountStatus)
                 messages.append(ChatMessage(role: .system, content: "Login ended before connection was confirmed. \(details)"))
             }
         } catch {
@@ -1255,14 +1266,18 @@ final class AppViewModel: ObservableObject {
     }
 
     private func isConnectedAccountStatus(_ status: String) -> Bool {
-        let lowered = status.lowercased()
+        let lowered = status.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if lowered.isEmpty { return false }
         if lowered.contains("not connected") || lowered.contains("cli not found") {
             return false
         }
         if lowered == "checking..." || lowered == "unavailable" || lowered == "unknown" || lowered.contains("connecting") {
             return false
         }
-        return true
+        if lowered.contains("logged in") || lowered.contains("connected") || lowered.contains("api key") {
+            return true
+        }
+        return false
     }
 
     private func waitForAccountConnection(maxWaitSeconds: Int, pollIntervalSeconds: UInt64) async -> Bool {
@@ -1286,6 +1301,9 @@ final class AppViewModel: ObservableObject {
     private func sanitizedLoginFailureDetails(_ raw: String) -> String {
         let clean = stripANSIEscapeCodes(from: raw).trimmingCharacters(in: .whitespacesAndNewlines)
         let lowered = clean.lowercased()
+        if lowered.contains("not connected") || lowered.contains("not logged") || lowered.contains("login required") {
+            return "Browser login did not complete. Please finish sign-in in the browser window and try again."
+        }
         if lowered.contains("never share this code") || lowered.contains("device code") {
             return "Browser login started, but the app could not confirm completion yet."
         }
@@ -1293,6 +1311,29 @@ final class AppViewModel: ObservableObject {
             return "Please finish sign-in in the browser, then click Refresh Account Status."
         }
         return conversationSafePlainEnglish(clean)
+    }
+
+    private func isIgnorableAccountStatusLine(_ line: String) -> Bool {
+        let lowered = line.lowercased()
+        if lowered.hasPrefix("warning:") || lowered.hasPrefix("tip:") {
+            return true
+        }
+        if lowered.hasPrefix("usage:") || lowered.hasPrefix("for more information") {
+            return true
+        }
+        return false
+    }
+
+    private func isConnectedAccountStatusLine(_ line: String) -> Bool {
+        let lowered = line.lowercased()
+        return lowered.contains("logged in") || lowered.contains("connected") || lowered.contains("api key")
+    }
+
+    private func truncateStatusLine(_ line: String, maxLength: Int = 80) -> String {
+        if line.count <= maxLength {
+            return line
+        }
+        return String(line.prefix(maxLength)) + "..."
     }
 
     private func stripANSIEscapeCodes(from text: String) -> String {
@@ -1657,7 +1698,7 @@ final class AppViewModel: ObservableObject {
         var values: [String] = []
         for file in latestDiffFiles.prefix(limit) {
             let compactPath = compactSummaryPath(file.path)
-            let stats = "+\(file.added)/-\(file.removed)"
+            let stats = diffStatText(added: file.added, removed: file.removed)
             if let line = firstLineByFile[file.path] {
                 values.append("\(compactPath) (line \(line), \(stats))")
             } else {
@@ -1678,7 +1719,7 @@ final class AppViewModel: ObservableObject {
         }
 
         let listed = fallbackChangedFiles.prefix(limit).map { path in
-            "\(compactSummaryPath(path)) (+0/-0)"
+            "\(compactSummaryPath(path)) (changed)"
         }
         var values = Array(listed)
         let remaining = fallbackChangedFiles.count - listed.count
@@ -1708,7 +1749,7 @@ final class AppViewModel: ObservableObject {
             }
             let count = fallbackChangedFiles.count
             let fileLabel = count == 1 ? "file" : "files"
-            let topFileSummaries = fallbackChangedFiles.prefix(5).map { "\(compactSummaryPath($0)) (+0/-0)" }
+            let topFileSummaries = fallbackChangedFiles.prefix(5).map { "\(compactSummaryPath($0)) (changed)" }
             var summary = "Updated \(count) \(fileLabel)"
             if !topFileSummaries.isEmpty {
                 summary += ": \(topFileSummaries.joined(separator: ", "))"
@@ -1722,7 +1763,7 @@ final class AppViewModel: ObservableObject {
         let fileCount = latestDiffFiles.count
         let fileLabel = fileCount == 1 ? "file" : "files"
         let topFileSummaries = latestDiffFiles.prefix(5).map { file in
-            "\(compactSummaryPath(file.path)) (+\(file.added)/-\(file.removed))"
+            "\(compactSummaryPath(file.path)) (\(diffStatText(added: file.added, removed: file.removed)))"
         }
 
         var summary = "Updated \(fileCount) \(fileLabel)"
@@ -1751,6 +1792,17 @@ final class AppViewModel: ObservableObject {
         let components = path.split(separator: "/").map(String.init)
         guard components.count > 3 else { return path }
         return components.suffix(3).joined(separator: "/")
+    }
+
+    private func diffStatText(added: Int, removed: Int) -> String {
+        if added == 0 && removed == 0 {
+            return "changed"
+        }
+        return "+\(added)/-\(removed)"
+    }
+
+    private func hasMeaningfulDiffStats() -> Bool {
+        latestDiffFiles.contains { $0.added > 0 || $0.removed > 0 }
     }
 
     private func formattedElapsedDuration(_ duration: TimeInterval) -> String {
@@ -2454,14 +2506,41 @@ final class AppViewModel: ObservableObject {
         }
 
         do {
-            let numstatOutput = try await runner.run(
-                command: "git diff --numstat -- .",
-                workingDirectory: projectPath
-            )
-            let patchOutput = try await runner.run(
-                command: "git diff --no-color --unified=0 -- .",
-                workingDirectory: projectPath
-            )
+            let hasHeadCommit = await currentGitHeadCommit() != nil
+            let numstatText: String
+            let patchText: String
+            if hasHeadCommit {
+                let numstatOutput = try await runner.run(
+                    command: "git diff --numstat HEAD -- .",
+                    workingDirectory: projectPath
+                )
+                let patchOutput = try await runner.run(
+                    command: "git diff --no-color --unified=0 HEAD -- .",
+                    workingDirectory: projectPath
+                )
+                numstatText = numstatOutput.stdout
+                patchText = patchOutput.stdout
+            } else {
+                let unstagedNumstatOutput = try await runner.run(
+                    command: "git diff --numstat -- .",
+                    workingDirectory: projectPath
+                )
+                let stagedNumstatOutput = try await runner.run(
+                    command: "git diff --numstat --cached -- .",
+                    workingDirectory: projectPath
+                )
+                numstatText = unstagedNumstatOutput.stdout + "\n" + stagedNumstatOutput.stdout
+
+                let unstagedPatchOutput = try await runner.run(
+                    command: "git diff --no-color --unified=0 -- .",
+                    workingDirectory: projectPath
+                )
+                let stagedPatchOutput = try await runner.run(
+                    command: "git diff --no-color --unified=0 --cached -- .",
+                    workingDirectory: projectPath
+                )
+                patchText = unstagedPatchOutput.stdout + "\n" + stagedPatchOutput.stdout
+            }
             let untrackedOutput = try await runner.run(
                 command: """
                 git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do
@@ -2474,7 +2553,7 @@ final class AppViewModel: ObservableObject {
             )
 
             var statsByFile: [String: (added: Int, removed: Int)] = [:]
-            for file in parseNumstat(numstatOutput.stdout + "\n" + untrackedOutput.stdout) {
+            for file in parseNumstat(numstatText + "\n" + untrackedOutput.stdout) {
                 let existing = statsByFile[file.path] ?? (0, 0)
                 statsByFile[file.path] = (existing.added + file.added, existing.removed + file.removed)
             }
@@ -2487,7 +2566,7 @@ final class AppViewModel: ObservableObject {
             latestDiffFiles = files
             latestDiffAdded = files.reduce(0) { $0 + $1.added }
             latestDiffRemoved = files.reduce(0) { $0 + $1.removed }
-            latestDiffLines = parseDiffLines(patchOutput.stdout, limit: 200)
+            latestDiffLines = parseDiffLines(patchText, limit: 200)
 
             if files.isEmpty {
                 appendActivity("No working tree changes detected.")
@@ -2550,11 +2629,6 @@ final class AppViewModel: ObservableObject {
 
         fallbackChangedFiles = Array(Set(found)).sorted()
         if !fallbackChangedFiles.isEmpty {
-            if latestDiffFiles.isEmpty {
-                latestDiffFiles = fallbackChangedFiles.map { DiffFileStat(path: $0, added: 0, removed: 0) }
-                latestDiffAdded = 0
-                latestDiffRemoved = 0
-            }
             appendActivity("Filesystem fallback detected \(fallbackChangedFiles.count) changed file(s).")
         }
     }
@@ -3038,12 +3112,18 @@ struct ContentView: View {
                                                         .font(.caption.weight(.semibold))
                                                         .lineLimit(1)
                                                     Spacer(minLength: 4)
-                                                    Text("+\(file.added)")
-                                                        .font(.caption.weight(.semibold))
-                                                        .foregroundColor(.green)
-                                                    Text("-\(file.removed)")
-                                                        .font(.caption.weight(.semibold))
-                                                        .foregroundColor(.red)
+                                                    if file.added == 0 && file.removed == 0 {
+                                                        Text("changed")
+                                                            .font(.caption.weight(.semibold))
+                                                            .foregroundColor(.secondary)
+                                                    } else {
+                                                        Text("+\(file.added)")
+                                                            .font(.caption.weight(.semibold))
+                                                            .foregroundColor(.green)
+                                                        Text("-\(file.removed)")
+                                                            .font(.caption.weight(.semibold))
+                                                            .foregroundColor(.red)
+                                                    }
                                                 }
                                             }
                                             .padding(8)
@@ -3425,12 +3505,18 @@ struct MessageBubble: View {
                                         .font(.caption2.weight(.semibold))
                                         .lineLimit(1)
                                     Spacer(minLength: 4)
-                                    Text("+\(file.added)")
-                                        .font(.caption2.weight(.semibold))
-                                        .foregroundColor(.green)
-                                    Text("-\(file.removed)")
-                                        .font(.caption2.weight(.semibold))
-                                        .foregroundColor(.red)
+                                    if file.added == 0 && file.removed == 0 {
+                                        Text("changed")
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundColor(.secondary)
+                                    } else {
+                                        Text("+\(file.added)")
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundColor(.green)
+                                        Text("-\(file.removed)")
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundColor(.red)
+                                    }
                                 }
 
                                 let rows = linePreviewForFile(file.path, limit: 20)
