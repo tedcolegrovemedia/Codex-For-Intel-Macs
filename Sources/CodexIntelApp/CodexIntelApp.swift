@@ -489,6 +489,7 @@ final class AppViewModel: ObservableObject {
     private var detectedStaleSessionErrorInCurrentRun = false
     private var stopRequested = false
     private var didReportStopForCurrentRun = false
+    private var fallbackChangedFiles: [String] = []
     private let genericDoneFallback = "Completed. I applied updates to your project and summarized the result."
 
     init() {
@@ -724,6 +725,9 @@ final class AppViewModel: ObservableObject {
             appendActivity("Codex response complete")
             thinkingStatus = ""
             await refreshChangeSummary()
+            if latestDiffFiles.isEmpty {
+                captureFilesystemChangeFallback(since: runStartedAt)
+            }
             if finalizeStopIfNeeded() { return }
             let doneSummary = resolvedDoneSummary(responseSummary)
             let validation = await runAutomaticValidationIfPossible()
@@ -1376,7 +1380,7 @@ final class AppViewModel: ObservableObject {
 
     private func changedFileReferenceLines(limit: Int) -> [String] {
         guard !latestDiffFiles.isEmpty else {
-            return ["No file edits were detected in this run."]
+            return fallbackChangedReferenceLines(limit: limit)
         }
 
         var firstLineByFile: [String: Int] = [:]
@@ -1405,6 +1409,22 @@ final class AppViewModel: ObservableObject {
         return values
     }
 
+    private func fallbackChangedReferenceLines(limit: Int) -> [String] {
+        guard !fallbackChangedFiles.isEmpty else {
+            return ["No file edits were detected in this run."]
+        }
+
+        let listed = fallbackChangedFiles.prefix(limit).map { path in
+            "\(compactSummaryPath(path)) (changed)"
+        }
+        var values = Array(listed)
+        let remaining = fallbackChangedFiles.count - listed.count
+        if remaining > 0 {
+            values.append("+\(remaining) more file(s)")
+        }
+        return values
+    }
+
     private func resolvedDoneSummary(_ summary: String) -> String {
         let normalized = summary.trimmingCharacters(in: .whitespacesAndNewlines)
         let generated = generatedSummaryFromChanges()
@@ -1420,7 +1440,20 @@ final class AppViewModel: ObservableObject {
 
     private func generatedSummaryFromChanges() -> String {
         if latestDiffFiles.isEmpty {
-            return "No file edits were detected in this run."
+            if fallbackChangedFiles.isEmpty {
+                return "No file edits were detected in this run."
+            }
+            let count = fallbackChangedFiles.count
+            let fileLabel = count == 1 ? "file" : "files"
+            let topFileSummaries = fallbackChangedFiles.prefix(5).map { compactSummaryPath($0) }
+            var summary = "Updated \(count) \(fileLabel)"
+            if !topFileSummaries.isEmpty {
+                summary += ": \(topFileSummaries.joined(separator: ", "))"
+            }
+            if count > topFileSummaries.count {
+                summary += "; +\(count - topFileSummaries.count) more file(s)"
+            }
+            return summary + "."
         }
 
         let fileCount = latestDiffFiles.count
@@ -1622,6 +1655,7 @@ final class AppViewModel: ObservableObject {
         latestDiffRemoved = 0
         latestDiffFiles.removeAll()
         latestDiffLines.removeAll()
+        fallbackChangedFiles.removeAll()
         showChangesAccordion = false
         detectedStaleSessionErrorInCurrentRun = false
         didReportStopForCurrentRun = false
@@ -2127,6 +2161,60 @@ final class AppViewModel: ObservableObject {
         } catch {
             log("Unable to build change summary: \(error.localizedDescription)")
             appendActivity("Unable to build change summary: \(error.localizedDescription)")
+        }
+    }
+
+    private func captureFilesystemChangeFallback(since runStartedAt: Date) {
+        let rootPath = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rootPath.isEmpty else {
+            fallbackChangedFiles = []
+            return
+        }
+
+        let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true)
+        let resourceKeys: Set<URLResourceKey> = [.isRegularFileKey, .contentModificationDateKey]
+        guard let enumerator = FileManager.default.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: Array(resourceKeys),
+            options: [.skipsPackageDescendants, .skipsHiddenFiles]
+        ) else {
+            fallbackChangedFiles = []
+            return
+        }
+
+        let threshold = runStartedAt.addingTimeInterval(-2)
+        let excludedPrefixes = [
+            ".git/",
+            ".build/",
+            "dist/",
+            "node_modules/",
+            ".swiftpm/",
+            "DerivedData/",
+            "Library/"
+        ]
+
+        var found: [String] = []
+        while let fileURL = enumerator.nextObject() as? URL {
+            guard let values = try? fileURL.resourceValues(forKeys: resourceKeys) else { continue }
+            guard values.isRegularFile == true else { continue }
+            guard let modifiedAt = values.contentModificationDate, modifiedAt >= threshold else { continue }
+
+            var relativePath = fileURL.path
+            if relativePath.hasPrefix(rootURL.path) {
+                relativePath = String(relativePath.dropFirst(rootURL.path.count))
+                if relativePath.hasPrefix("/") {
+                    relativePath.removeFirst()
+                }
+            }
+            guard !relativePath.isEmpty else { continue }
+            guard !excludedPrefixes.contains(where: { relativePath.hasPrefix($0) }) else { continue }
+
+            found.append(relativePath)
+        }
+
+        fallbackChangedFiles = Array(Set(found)).sorted()
+        if !fallbackChangedFiles.isEmpty {
+            appendActivity("Filesystem fallback detected \(fallbackChangedFiles.count) changed file(s).")
         }
     }
 
