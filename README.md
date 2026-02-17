@@ -9,6 +9,8 @@ Native macOS (SwiftUI) GUI for driving Codex from CLI on Intel Macs.
 3. Open the selected project in VS Code.
 4. Automatically run dependency setup when a project folder is selected.
 5. Auto-commit and auto-push after each chat turn (plus manual `Push` / `Commit + Push` buttons).
+6. Stream live Codex activity ("thinking", tool events, errors) while each turn runs.
+7. Show added/removed line summary with file-level stats and line previews after each run.
 
 ## Requirements
 
@@ -46,7 +48,10 @@ open dist/CodexIntelApp.app
 
 ## Codex command
 
-The app runs Codex directly (not through a shell `codex` command) with `exec`, then passes conversation context + your latest chat message. Commands run with the selected project as the working directory.
+The app runs Codex directly (not through a shell `codex` command) with:
+- `exec --json --full-auto --skip-git-repo-check --output-last-message <temp file>`
+
+It passes recent conversation context + your latest chat message. Commands run with the selected project as the working directory, and Codex is instructed to implement changes directly (not suggestion-only mode).
 
 It auto-searches for executable names (`codex`, `codex-x86_64-apple-darwin`, `codex-aarch64-apple-darwin`) in:
 - `/Applications/Codex.app/Contents/Resources/codex`
@@ -56,7 +61,7 @@ It auto-searches for executable names (`codex`, `codex-x86_64-apple-darwin`, `co
 The app also injects a fallback PATH (`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` + Codex app paths) to avoid GUI PATH issues that cause exit code `127`.
 If needed, set `Codex Path (optional override)` in the app or use env var `CODEX_BINARY=/absolute/path/to/codex`.
 When selecting/running a project, the app also runs `chmod u+rwx <project_dir>` to ensure directory access.
-If git remote/branch are not configured, Codex is invoked with `--skip-git-repo-check`.
+If git remote/branch are not configured, git actions stay disabled, but Codex still runs in the project folder.
 
 ## Automatic setup
 

@@ -31,6 +31,30 @@ struct CommandOutput {
     let exitCode: Int32
 }
 
+enum StreamSource {
+    case stdout
+    case stderr
+}
+
+struct DiffFileStat: Identifiable {
+    let id = UUID()
+    let path: String
+    let added: Int
+    let removed: Int
+}
+
+enum DiffLineKind {
+    case added
+    case removed
+}
+
+struct DiffLine: Identifiable {
+    let id = UUID()
+    let file: String
+    let kind: DiffLineKind
+    let text: String
+}
+
 enum ViewModelError: LocalizedError {
     case projectNotSelected
     case emptyPrompt
@@ -93,6 +117,31 @@ struct ShellRunner {
         }
     }
 
+    func runStreaming(
+        executablePath: String,
+        arguments: [String],
+        workingDirectory: String?,
+        environment: [String: String]? = nil,
+        onLine: @escaping @Sendable (StreamSource, String) -> Void
+    ) async throws -> CommandOutput {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let output = try ShellRunner.runSyncStreaming(
+                        executablePath: executablePath,
+                        arguments: arguments,
+                        workingDirectory: workingDirectory,
+                        environment: environment,
+                        onLine: onLine
+                    )
+                    continuation.resume(returning: output)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     private static func runSync(
         command: String,
         workingDirectory: String?,
@@ -127,6 +176,25 @@ struct ShellRunner {
         return try runProcess(process, environment: env)
     }
 
+    private static func runSyncStreaming(
+        executablePath: String,
+        arguments: [String],
+        workingDirectory: String?,
+        environment: [String: String]? = nil,
+        onLine: @escaping @Sendable (StreamSource, String) -> Void
+    ) throws -> CommandOutput {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+        if let workingDirectory, !workingDirectory.isEmpty {
+            process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+        }
+
+        let executableDirectory = URL(fileURLWithPath: executablePath).deletingLastPathComponent().path
+        let env = environment ?? enrichedEnvironment(extraPathDirectories: [executableDirectory])
+        return try runProcessStreaming(process, environment: env, onLine: onLine)
+    }
+
     private static func runProcess(_ process: Process, environment: [String: String]) throws -> CommandOutput {
         process.environment = environment
 
@@ -154,6 +222,94 @@ struct ShellRunner {
         let stdout = (try? String(contentsOf: stdoutURL, encoding: .utf8)) ?? ""
         let stderr = (try? String(contentsOf: stderrURL, encoding: .utf8)) ?? ""
         return CommandOutput(stdout: stdout, stderr: stderr, exitCode: process.terminationStatus)
+    }
+
+    private static func runProcessStreaming(
+        _ process: Process,
+        environment: [String: String],
+        onLine: @escaping @Sendable (StreamSource, String) -> Void
+    ) throws -> CommandOutput {
+        process.environment = environment
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        let lock = NSLock()
+        var stdoutText = ""
+        var stderrText = ""
+        var stdoutBuffer = ""
+        var stderrBuffer = ""
+
+        func appendChunk(_ text: String, source: StreamSource) {
+            guard !text.isEmpty else { return }
+            lock.lock()
+            switch source {
+            case .stdout:
+                stdoutText += text
+                stdoutBuffer += text
+                let parts = stdoutBuffer.components(separatedBy: "\n")
+                for line in parts.dropLast() {
+                    let trimmed = line.trimmingCharacters(in: .newlines)
+                    if !trimmed.isEmpty {
+                        onLine(.stdout, trimmed)
+                    }
+                }
+                stdoutBuffer = parts.last ?? ""
+            case .stderr:
+                stderrText += text
+                stderrBuffer += text
+                let parts = stderrBuffer.components(separatedBy: "\n")
+                for line in parts.dropLast() {
+                    let trimmed = line.trimmingCharacters(in: .newlines)
+                    if !trimmed.isEmpty {
+                        onLine(.stderr, trimmed)
+                    }
+                }
+                stderrBuffer = parts.last ?? ""
+            }
+            lock.unlock()
+        }
+
+        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            appendChunk(text, source: .stdout)
+        }
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            appendChunk(text, source: .stderr)
+        }
+
+        try process.run()
+        process.waitUntilExit()
+
+        stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
+
+        let remainingOut = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        if let text = String(data: remainingOut, encoding: .utf8), !text.isEmpty {
+            appendChunk(text, source: .stdout)
+        }
+        let remainingErr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        if let text = String(data: remainingErr, encoding: .utf8), !text.isEmpty {
+            appendChunk(text, source: .stderr)
+        }
+
+        lock.lock()
+        if !stdoutBuffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            onLine(.stdout, stdoutBuffer.trimmingCharacters(in: .newlines))
+        }
+        if !stderrBuffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            onLine(.stderr, stderrBuffer.trimmingCharacters(in: .newlines))
+        }
+        stdoutBuffer = ""
+        stderrBuffer = ""
+        let output = CommandOutput(stdout: stdoutText, stderr: stderrText, exitCode: process.terminationStatus)
+        lock.unlock()
+        return output
     }
 
     private static func enrichedEnvironment(extraPathDirectories: [String] = []) -> [String: String] {
@@ -201,12 +357,18 @@ final class AppViewModel: ObservableObject {
     @Published var messages: [ChatMessage] = [
         ChatMessage(
             role: .system,
-            content: "Select a project folder, then send prompts. Codex commands run in that project directory."
+            content: "Select a project folder, then send prompts. Codex runs in autonomous edit mode in that directory."
         )
     ]
     @Published var commandLog: [String] = []
     @Published var isBusy = false
     @Published var busyLabel = ""
+    @Published var thinkingStatus = ""
+    @Published var liveActivity: [String] = []
+    @Published var latestDiffAdded = 0
+    @Published var latestDiffRemoved = 0
+    @Published var latestDiffFiles: [DiffFileStat] = []
+    @Published var latestDiffLines: [DiffLine] = []
 
     private let runner = ShellRunner()
     private var resolvedCodexExecutable: String?
@@ -301,30 +463,56 @@ final class AppViewModel: ObservableObject {
     }
 
     private func runCodex(for userPrompt: String) async {
+        resetRunFeedback()
+        let lastMessageURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("codex-intel-last-\(UUID().uuidString).txt")
+
         do {
             try validateProjectAndTemplate(prompt: userPrompt)
             let codexExecutable = try await ensureCodexExecutableAvailable()
             await ensureProjectDirectoryTrustAndAccess()
             let enrichedPrompt = buildPromptWithHistory(newPrompt: userPrompt)
-            let codexArguments: [String] = ["exec", "--skip-git-repo-check", enrichedPrompt]
-            let output = try await executeBusyExecutable(
+            thinkingStatus = "Thinking..."
+            appendActivity("Starting Codex in autonomous mode")
+
+            let codexArguments: [String] = [
+                "exec",
+                "--json",
+                "--full-auto",
+                "--skip-git-repo-check",
+                "--output-last-message", lastMessageURL.path,
+                enrichedPrompt
+            ]
+            let output = try await executeBusyExecutableStreaming(
                 label: "Running Codex",
                 executablePath: codexExecutable,
                 arguments: codexArguments
-            )
+            ) { [weak self] source, line in
+                Task { @MainActor in
+                    self?.handleCodexStreamLine(source: source, line: line)
+                }
+            }
             if output.exitCode != 0 {
                 log("Codex exited with code \(output.exitCode)")
                 let errorText = preferredFailureText(output)
                 messages.append(ChatMessage(role: .assistant, content: "Codex failed (\(output.exitCode)).\n\(errorText)"))
+                appendActivity("Codex exited with code \(output.exitCode)")
+                thinkingStatus = ""
                 return
             }
-            let response = cleanOutput(output.stdout, fallback: output.stderr)
+            let response = readAssistantOutput(from: lastMessageURL, fallback: cleanOutput(output.stdout, fallback: output.stderr))
             messages.append(ChatMessage(role: .assistant, content: response))
+            appendActivity("Codex response complete")
+            thinkingStatus = ""
+            await refreshChangeSummary()
         } catch {
             let text = error.localizedDescription
             messages.append(ChatMessage(role: .assistant, content: "Error: \(text)"))
             log("Error: \(text)")
+            appendActivity("Error: \(text)")
+            thinkingStatus = ""
         }
+        try? FileManager.default.removeItem(at: lastMessageURL)
         await autoCommitAndPushAfterChat()
     }
 
@@ -429,6 +617,32 @@ final class AppViewModel: ObservableObject {
         )
     }
 
+    private func executeBusyExecutableStreaming(
+        label: String,
+        executablePath: String,
+        arguments: [String],
+        workingDirectory: String? = nil,
+        environment: [String: String]? = nil,
+        onLine: @escaping @Sendable (StreamSource, String) -> Void
+    ) async throws -> CommandOutput {
+        isBusy = true
+        busyLabel = label
+        let rendered = ([shellQuote(executablePath)] + arguments.map { shellQuote($0) }).joined(separator: " ")
+        log("[\(label)] \(rendered)")
+        defer {
+            isBusy = false
+            busyLabel = ""
+        }
+        let directory = workingDirectory ?? projectPath
+        return try await runner.runStreaming(
+            executablePath: executablePath,
+            arguments: arguments,
+            workingDirectory: directory,
+            environment: environment,
+            onLine: onLine
+        )
+    }
+
     private func validateProjectAndTemplate(prompt: String) throws {
         try validateProjectSelected()
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -450,7 +664,10 @@ final class AppViewModel: ObservableObject {
         }.joined(separator: "\n")
 
         return """
-        Continue this coding conversation. Keep the response concise and action-focused.
+        You are operating as an autonomous coding agent in the selected project folder.
+        Implement requested changes directly in files and run needed commands.
+        Do not stop at suggestions when you can safely make the change in this workspace.
+        Keep your final response concise and action-focused.
         Recent conversation:
         \(recentHistory)
 
@@ -707,6 +924,247 @@ final class AppViewModel: ObservableObject {
         )
     }
 
+    private func resetRunFeedback() {
+        thinkingStatus = ""
+        liveActivity.removeAll()
+        latestDiffAdded = 0
+        latestDiffRemoved = 0
+        latestDiffFiles.removeAll()
+        latestDiffLines.removeAll()
+    }
+
+    private func appendActivity(_ value: String) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        liveActivity.append(trimmed)
+        if liveActivity.count > 220 {
+            liveActivity.removeFirst(liveActivity.count - 220)
+        }
+    }
+
+    private func handleCodexStreamLine(source: StreamSource, line: String) {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        guard let event = parseCodexJSONEvent(from: trimmed) else {
+            if source == .stderr {
+                log("[codex] \(trimmed)")
+                if trimmed.contains("WARN") || trimmed.contains("Error") || trimmed.contains("error") {
+                    appendActivity(trimmed)
+                }
+            }
+            return
+        }
+
+        let type = (event["type"] as? String) ?? "event"
+        if type.contains("delta") {
+            return
+        }
+
+        switch type {
+        case "turn.started":
+            thinkingStatus = "Thinking..."
+            appendActivity("Thinking...")
+        case "turn.completed":
+            thinkingStatus = "Applying changes..."
+            appendActivity("Applying edits...")
+        case "turn.failed":
+            thinkingStatus = ""
+            appendActivity("Codex failed")
+        default:
+            if let summary = summarizeCodexEvent(type: type, event: event) {
+                appendActivity(summary)
+            }
+        }
+    }
+
+    private func parseCodexJSONEvent(from line: String) -> [String: Any]? {
+        guard let data = line.data(using: .utf8) else { return nil }
+        guard let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        return object as? [String: Any]
+    }
+
+    private func summarizeCodexEvent(type: String, event: [String: Any]) -> String? {
+        if type == "thread.started" || type == "thread.completed" {
+            return nil
+        }
+        if type == "error" {
+            let message = (event["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Unknown error"
+            return "Error: \(message)"
+        }
+
+        if let command = event["command"] as? String, !command.isEmpty {
+            return "Running: \(command)"
+        }
+
+        if let message = event["message"] as? String, !message.isEmpty {
+            return message
+        }
+
+        if let item = event["item"] as? [String: Any] {
+            if let toolName = item["tool_name"] as? String, !toolName.isEmpty {
+                return "Tool: \(toolName)"
+            }
+            if let content = item["content"] {
+                let values = flattenedStrings(from: content)
+                if let first = values.first(where: { !$0.isEmpty }) {
+                    return first
+                }
+            }
+        }
+
+        if let content = event["content"] {
+            let values = flattenedStrings(from: content)
+            if let first = values.first(where: { !$0.isEmpty }) {
+                return first
+            }
+        }
+
+        if type.contains("tool") {
+            return "Tool event: \(type)"
+        }
+        if type.contains("turn") {
+            return "Turn event: \(type)"
+        }
+        return nil
+    }
+
+    private func flattenedStrings(from value: Any) -> [String] {
+        if let text = value as? String {
+            return [text.trimmingCharacters(in: .whitespacesAndNewlines)]
+        }
+        if let array = value as? [Any] {
+            return array.flatMap { flattenedStrings(from: $0) }
+        }
+        if let dictionary = value as? [String: Any] {
+            return dictionary.values.flatMap { flattenedStrings(from: $0) }
+        }
+        return []
+    }
+
+    private func readAssistantOutput(from url: URL, fallback: String) -> String {
+        guard let raw = try? String(contentsOf: url, encoding: .utf8) else {
+            return fallback
+        }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+
+    private func refreshChangeSummary() async {
+        guard await isGitWorkspace() else {
+            appendActivity("No git repository detected. Change summary is unavailable.")
+            return
+        }
+
+        do {
+            let numstatOutput = try await runner.run(
+                command: "git diff --numstat -- .",
+                workingDirectory: projectPath
+            )
+            let patchOutput = try await runner.run(
+                command: "git diff --no-color --unified=0 -- .",
+                workingDirectory: projectPath
+            )
+            let untrackedOutput = try await runner.run(
+                command: """
+                git ls-files --others --exclude-standard -z | while IFS= read -r -d '' f; do
+                  lines="$(wc -l < "$f" | tr -d '[:space:]')"
+                  if [ -z "$lines" ]; then lines=0; fi
+                  printf "%s\\t0\\t%s\\n" "$lines" "$f"
+                done
+                """,
+                workingDirectory: projectPath
+            )
+
+            var statsByFile: [String: (added: Int, removed: Int)] = [:]
+            for file in parseNumstat(numstatOutput.stdout + "\n" + untrackedOutput.stdout) {
+                let existing = statsByFile[file.path] ?? (0, 0)
+                statsByFile[file.path] = (existing.added + file.added, existing.removed + file.removed)
+            }
+
+            let files = statsByFile.keys.sorted().map { path in
+                let value = statsByFile[path] ?? (0, 0)
+                return DiffFileStat(path: path, added: value.added, removed: value.removed)
+            }
+
+            latestDiffFiles = files
+            latestDiffAdded = files.reduce(0) { $0 + $1.added }
+            latestDiffRemoved = files.reduce(0) { $0 + $1.removed }
+            latestDiffLines = parseDiffLines(patchOutput.stdout, limit: 200)
+
+            if files.isEmpty {
+                appendActivity("No working tree changes detected.")
+            } else {
+                appendActivity("Changed lines: +\(latestDiffAdded) / -\(latestDiffRemoved) across \(files.count) file(s).")
+            }
+        } catch {
+            log("Unable to build change summary: \(error.localizedDescription)")
+            appendActivity("Unable to build change summary: \(error.localizedDescription)")
+        }
+    }
+
+    private func isGitWorkspace() async -> Bool {
+        guard !projectPath.isEmpty else { return false }
+        guard let output = try? await runner.run(
+            command: "git rev-parse --is-inside-work-tree",
+            workingDirectory: projectPath
+        ) else { return false }
+        guard output.exitCode == 0 else { return false }
+        let text = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return text == "true"
+    }
+
+    private func parseNumstat(_ text: String) -> [DiffFileStat] {
+        text
+            .split(separator: "\n")
+            .compactMap { rawLine in
+                let parts = rawLine.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+                guard parts.count == 3 else { return nil }
+                let added = Int(parts[0]) ?? 0
+                let removed = Int(parts[1]) ?? 0
+                let path = String(parts[2]).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !path.isEmpty else { return nil }
+                return DiffFileStat(path: path, added: added, removed: removed)
+            }
+    }
+
+    private func parseDiffLines(_ diffText: String, limit: Int) -> [DiffLine] {
+        var currentFile = "(unknown)"
+        var lines: [DiffLine] = []
+
+        for raw in diffText.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(raw)
+
+            if line.hasPrefix("diff --git ") {
+                let parts = line.split(separator: " ")
+                if let candidate = parts.last {
+                    let value = String(candidate)
+                    currentFile = value.hasPrefix("b/") ? String(value.dropFirst(2)) : value
+                }
+                continue
+            }
+            if line.hasPrefix("+++ b/") {
+                currentFile = String(line.dropFirst(6))
+                continue
+            }
+            if line.hasPrefix("--- ") || line.hasPrefix("index ") || line.hasPrefix("@@") || line.hasPrefix("new file mode") || line.hasPrefix("deleted file mode") {
+                continue
+            }
+
+            if line.hasPrefix("+"), !line.hasPrefix("+++") {
+                lines.append(DiffLine(file: currentFile, kind: .added, text: String(line.dropFirst())))
+            } else if line.hasPrefix("-"), !line.hasPrefix("---") {
+                lines.append(DiffLine(file: currentFile, kind: .removed, text: String(line.dropFirst())))
+            }
+
+            if lines.count >= limit {
+                break
+            }
+        }
+
+        return lines
+    }
+
     private func log(_ message: String) {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
@@ -828,6 +1286,102 @@ struct ContentView: View {
                     .background(Color(nsColor: .controlBackgroundColor))
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Live Activity")
+                        .font(.headline)
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 6) {
+                            if viewModel.liveActivity.isEmpty {
+                                Text("Activity appears here while Codex is running.")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            } else {
+                                ForEach(Array(viewModel.liveActivity.enumerated()), id: \.offset) { _, line in
+                                    Text(line)
+                                        .font(.caption2)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                            }
+                        }
+                    }
+                    .frame(minHeight: 120, maxHeight: 180)
+                    .padding(8)
+                    .background(Color(nsColor: .controlBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+
+                Divider()
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Changes (Last Run)")
+                        .font(.headline)
+                    HStack(spacing: 10) {
+                        Text("+\(viewModel.latestDiffAdded)")
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(.green)
+                        Text("-\(viewModel.latestDiffRemoved)")
+                            .font(.caption.weight(.semibold))
+                            .foregroundColor(.red)
+                    }
+
+                    if viewModel.latestDiffFiles.isEmpty {
+                        Text("No change summary available yet.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 6) {
+                                ForEach(viewModel.latestDiffFiles) { file in
+                                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                        Text(file.path)
+                                            .font(.caption2)
+                                            .lineLimit(1)
+                                        Spacer(minLength: 4)
+                                        Text("+\(file.added)")
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundColor(.green)
+                                        Text("-\(file.removed)")
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundColor(.red)
+                                    }
+                                }
+                            }
+                        }
+                        .frame(minHeight: 90, maxHeight: 140)
+                        .padding(8)
+                        .background(Color(nsColor: .controlBackgroundColor))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+
+                    if !viewModel.latestDiffLines.isEmpty {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 6) {
+                                ForEach(viewModel.latestDiffLines) { line in
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(line.file)
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                        HStack(alignment: .top, spacing: 6) {
+                                            Text(line.kind == .added ? "+" : "-")
+                                                .font(.caption.weight(.semibold))
+                                                .foregroundColor(line.kind == .added ? .green : .red)
+                                            Text(line.text)
+                                                .font(.system(.caption, design: .monospaced))
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        .frame(minHeight: 120, maxHeight: 200)
+                        .padding(8)
+                        .background(Color(nsColor: .controlBackgroundColor))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                }
             }
             .padding(16)
         }
@@ -842,7 +1396,7 @@ struct ContentView: View {
                 if viewModel.isBusy {
                     ProgressView()
                         .controlSize(.small)
-                    Text(viewModel.busyLabel)
+                    Text(viewModel.thinkingStatus.isEmpty ? viewModel.busyLabel : viewModel.thinkingStatus)
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
