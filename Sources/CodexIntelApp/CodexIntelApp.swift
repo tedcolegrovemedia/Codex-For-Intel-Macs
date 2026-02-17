@@ -441,6 +441,7 @@ final class AppViewModel: ObservableObject {
     @Published var busyLabel = ""
     @Published var thinkingStatus = ""
     @Published var liveActivity: [String] = []
+    @Published var thinkingHighlights: [String] = []
     @Published var latestDiffAdded = 0
     @Published var latestDiffRemoved = 0
     @Published var latestDiffFiles: [DiffFileStat] = []
@@ -633,7 +634,7 @@ final class AppViewModel: ObservableObject {
 
             resetAssistantCapture()
             let prompt = buildPromptWithHistory(newPrompt: userPrompt)
-            thinkingStatus = "Thinking..."
+            thinkingStatus = "Analyzing your request..."
             appendActivity("Running autonomous Codex turn")
 
             let codexArguments = buildCodexTurnArguments(prompt: prompt)
@@ -1568,6 +1569,7 @@ final class AppViewModel: ObservableObject {
     private func resetRunFeedback() {
         thinkingStatus = ""
         liveActivity.removeAll()
+        thinkingHighlights.removeAll()
         latestDiffAdded = 0
         latestDiffRemoved = 0
         latestDiffFiles.removeAll()
@@ -1583,6 +1585,89 @@ final class AppViewModel: ObservableObject {
         if liveActivity.count > 220 {
             liveActivity.removeFirst(liveActivity.count - 220)
         }
+        updateThinkingProgress(from: trimmed)
+    }
+
+    private func updateThinkingProgress(from rawValue: String) {
+        guard isBusy else { return }
+        guard let status = summarizedProgressLine(from: rawValue) else { return }
+        thinkingStatus = status
+
+        if thinkingHighlights.last != status {
+            thinkingHighlights.append(status)
+            if thinkingHighlights.count > 10 {
+                thinkingHighlights.removeFirst(thinkingHighlights.count - 10)
+            }
+        }
+    }
+
+    private func summarizedProgressLine(from rawValue: String) -> String? {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let lowered = trimmed.lowercased()
+        if lowered == "thinking..." || lowered == "running autonomous codex turn" {
+            return "Reviewing your request and planning edits..."
+        }
+        if lowered == "applying edits..." || lowered == "applying file changes." {
+            return "Applying edits to files..."
+        }
+        if lowered == "codex response complete" {
+            return "Preparing your summary..."
+        }
+        if lowered.contains("stale codex session") {
+            return "Refreshing stale session and retrying..."
+        }
+        if lowered.hasPrefix("running validation:") {
+            return trimmed
+        }
+        if lowered.hasPrefix("validation passed:") {
+            return trimmed
+        }
+        if lowered.hasPrefix("validation failed:") {
+            return trimmed
+        }
+        if lowered.contains("auto commit + push") || lowered.contains("auto push") {
+            return "Pushing updates to git..."
+        }
+
+        if trimmed.hasPrefix("Running: ") {
+            let command = String(trimmed.dropFirst("Running: ".count))
+            return "Running command: \(compactProgressCommand(command))"
+        }
+
+        if trimmed.hasPrefix("Tool: ") {
+            let tool = String(trimmed.dropFirst("Tool: ".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !tool.isEmpty {
+                return "Using tool: \(tool)"
+            }
+            return nil
+        }
+
+        if trimmed.hasPrefix("Error: ") {
+            return "Handling an issue and retrying..."
+        }
+
+        if trimmed.hasPrefix("Changed lines:") {
+            return "Collecting change summary..."
+        }
+
+        if trimmed.hasPrefix("Session ") {
+            return trimmed
+        }
+
+        return nil
+    }
+
+    private func compactProgressCommand(_ command: String) -> String {
+        let compact = command
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !compact.isEmpty else { return "(command)" }
+        if compact.count <= 72 {
+            return compact
+        }
+        return String(compact.prefix(69)) + "..."
     }
 
     private func handleCodexStreamLine(source: StreamSource, line: String) {
@@ -1617,11 +1702,9 @@ final class AppViewModel: ObservableObject {
 
         switch type {
         case "turn.started":
-            thinkingStatus = "Thinking..."
-            appendActivity("Thinking...")
+            appendActivity("Reviewing request and planning edits.")
         case "turn.completed":
-            thinkingStatus = "Applying changes..."
-            appendActivity("Applying edits...")
+            appendActivity("Applying file changes.")
         case "turn.failed":
             thinkingStatus = ""
             appendActivity("Codex failed")
@@ -2534,6 +2617,17 @@ struct ContentView: View {
                             .foregroundColor(.secondary)
                             .lineLimit(2)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
+                    if viewModel.isBusy, !viewModel.thinkingHighlights.isEmpty {
+                        VStack(alignment: .leading, spacing: 3) {
+                            ForEach(Array(viewModel.thinkingHighlights.suffix(3).enumerated()), id: \.offset) { _, item in
+                                Text("• \(item)")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
                     }
 
                     HStack(alignment: .bottom, spacing: 12) {
