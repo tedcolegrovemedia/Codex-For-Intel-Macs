@@ -2412,6 +2412,7 @@ final class AppViewModel: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var viewModel = AppViewModel()
+    @State private var collapsedChangeFiles: Set<String> = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2562,50 +2563,54 @@ struct ContentView: View {
                     DisclosureGroup(isExpanded: $viewModel.showChangesAccordion) {
                         VStack(alignment: .leading, spacing: 10) {
                             if viewModel.latestDiffFiles.isEmpty {
-                                Text("No change summary available yet.")
+                                Text("No line updates available yet.")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             } else {
-                                ScrollView {
-                                    VStack(alignment: .leading, spacing: 6) {
-                                        ForEach(viewModel.latestDiffFiles) { file in
-                                            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                                Text(file.path)
-                                                    .font(.caption2)
-                                                    .lineLimit(1)
-                                                Spacer(minLength: 4)
-                                                Text("+\(file.added)")
-                                                    .font(.caption2.weight(.semibold))
-                                                    .foregroundColor(.green)
-                                                Text("-\(file.removed)")
-                                                    .font(.caption2.weight(.semibold))
-                                                    .foregroundColor(.red)
-                                            }
-                                        }
-                                    }
-                                }
-                                .frame(minHeight: 90, maxHeight: 130)
-                                .padding(8)
-                                .background(Color(nsColor: .controlBackgroundColor))
-                                .clipShape(RoundedRectangle(cornerRadius: 8))
-                            }
+                                Text("\(viewModel.latestDiffFiles.count) \(viewModel.latestDiffFiles.count == 1 ? "file" : "files") changed")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundColor(.secondary)
 
-                            if !viewModel.latestDiffLines.isEmpty {
                                 ScrollView {
-                                    VStack(alignment: .leading, spacing: 6) {
-                                        ForEach(viewModel.latestDiffLines) { line in
-                                            HStack(alignment: .top, spacing: 6) {
-                                                Text(line.kind == .added ? "+" : "-")
-                                                    .font(.caption.weight(.semibold))
-                                                    .foregroundColor(line.kind == .added ? .green : .red)
-                                                Text(line.text)
-                                                    .font(.system(.caption, design: .monospaced))
-                                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    VStack(alignment: .leading, spacing: 10) {
+                                        ForEach(viewModel.latestDiffFiles) { file in
+                                            DisclosureGroup(isExpanded: changeFileExpandedBinding(for: file.path)) {
+                                                let previewLines = diffLinesPreview(for: file.path, limit: 90)
+                                                if previewLines.isEmpty {
+                                                    Text("No line-level preview available for this file.")
+                                                        .font(.caption2)
+                                                        .foregroundColor(.secondary)
+                                                        .padding(.vertical, 4)
+                                                } else {
+                                                    VStack(spacing: 0) {
+                                                        ForEach(previewLines) { line in
+                                                            diffLinePreviewRow(line)
+                                                        }
+                                                    }
+                                                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                                                }
+                                            } label: {
+                                                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                                    Text(file.path)
+                                                        .font(.caption.weight(.semibold))
+                                                        .lineLimit(1)
+                                                    Spacer(minLength: 4)
+                                                    Text("+\(file.added)")
+                                                        .font(.caption.weight(.semibold))
+                                                        .foregroundColor(.green)
+                                                    Text("-\(file.removed)")
+                                                        .font(.caption.weight(.semibold))
+                                                        .foregroundColor(.red)
+                                                }
                                             }
+                                            .padding(8)
+                                            .background(Color(nsColor: .controlBackgroundColor))
+                                            .clipShape(RoundedRectangle(cornerRadius: 8))
                                         }
                                     }
+                                    .padding(.vertical, 2)
                                 }
-                                .frame(minHeight: 90, maxHeight: 170)
+                                .frame(minHeight: 180, maxHeight: 360)
                                 .padding(8)
                                 .background(Color(nsColor: .controlBackgroundColor))
                                 .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -2835,6 +2840,56 @@ struct ContentView: View {
             .clipShape(RoundedRectangle(cornerRadius: 10))
             .padding(.horizontal, 16)
             .padding(.bottom, 16)
+        }
+    }
+
+    private func changeFileExpandedBinding(for path: String) -> Binding<Bool> {
+        Binding(
+            get: { !collapsedChangeFiles.contains(path) },
+            set: { expanded in
+                if expanded {
+                    collapsedChangeFiles.remove(path)
+                } else {
+                    collapsedChangeFiles.insert(path)
+                }
+            }
+        )
+    }
+
+    private func diffLinesPreview(for filePath: String, limit: Int) -> [DiffLine] {
+        Array(viewModel.latestDiffLines.filter { $0.file == filePath }.prefix(limit))
+    }
+
+    private func diffLinePreviewRow(_ line: DiffLine) -> some View {
+        let isAdded = line.kind == .added
+        let sign = isAdded ? "+" : "-"
+        let lineText = line.text.isEmpty ? " " : line.text
+
+        return HStack(spacing: 0) {
+            Text(line.lineNumber.map(String.init) ?? "·")
+                .font(.system(size: 11, weight: .regular, design: .monospaced))
+                .foregroundColor(.secondary)
+                .frame(width: 52, alignment: .trailing)
+                .padding(.trailing, 8)
+                .padding(.vertical, 2)
+                .background(Color.black.opacity(0.18))
+
+            HStack(spacing: 6) {
+                Text(sign)
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundColor(isAdded ? .green : .red)
+                Text(lineText)
+                    .font(.system(size: 12, weight: .regular, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 2)
+            .background((isAdded ? Color.green : Color.red).opacity(0.16))
+        }
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill((isAdded ? Color.green : Color.red).opacity(0.95))
+                .frame(width: 3)
         }
     }
 }
