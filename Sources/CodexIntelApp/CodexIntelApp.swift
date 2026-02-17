@@ -490,6 +490,9 @@ final class AppViewModel: ObservableObject {
     private var stopRequested = false
     private var didReportStopForCurrentRun = false
     private var fallbackChangedFiles: [String] = []
+    private var runHeartbeatTask: Task<Void, Never>?
+    private var runStartedAt: Date?
+    private var lastProgressAt: Date?
     private let genericDoneFallback = "Completed. I applied updates to your project and summarized the result."
 
     init() {
@@ -666,6 +669,8 @@ final class AppViewModel: ObservableObject {
         resetAssistantCapture()
         stopRequested = false
         let runStartedAt = Date()
+        beginRunHeartbeat(startedAt: runStartedAt)
+        defer { stopRunHeartbeat() }
 
         do {
             try validateProjectAndTemplate(prompt: userPrompt)
@@ -1648,6 +1653,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func resetRunFeedback() {
+        stopRunHeartbeat()
         thinkingStatus = ""
         liveActivity.removeAll()
         thinkingHighlights.removeAll()
@@ -1682,10 +1688,82 @@ final class AppViewModel: ObservableObject {
         updateThinkingProgress(from: trimmed)
     }
 
+    private func beginRunHeartbeat(startedAt: Date) {
+        stopRunHeartbeat()
+        runStartedAt = startedAt
+        lastProgressAt = startedAt
+        runHeartbeatTask = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                self.updateHeartbeatProgress()
+            }
+        }
+    }
+
+    private func stopRunHeartbeat() {
+        runHeartbeatTask?.cancel()
+        runHeartbeatTask = nil
+        runStartedAt = nil
+        lastProgressAt = nil
+    }
+
+    private func updateHeartbeatProgress() {
+        guard isBusy else { return }
+        guard let runStartedAt else { return }
+
+        let now = Date()
+        let elapsed = max(1, Int(now.timeIntervalSince(runStartedAt)))
+        let idleFor = max(0, Int(now.timeIntervalSince(lastProgressAt ?? runStartedAt)))
+        let base = statusWithoutElapsedSuffix(thinkingStatus.isEmpty ? busyLabel : thinkingStatus)
+        let normalizedBase = base.isEmpty ? "Working..." : base
+        let withElapsed = "\(normalizedBase) (\(elapsed)s)"
+        if thinkingStatus != withElapsed {
+            thinkingStatus = withElapsed
+        }
+
+        if idleFor >= 8, elapsed % 8 == 0 {
+            let hint = heartbeatHint(idleFor: idleFor)
+            if thinkingHighlights.last != hint {
+                thinkingHighlights.append(hint)
+                if thinkingHighlights.count > 12 {
+                    thinkingHighlights.removeFirst(thinkingHighlights.count - 12)
+                }
+            }
+        }
+    }
+
+    private func heartbeatHint(idleFor: Int) -> String {
+        let base = statusWithoutElapsedSuffix(thinkingStatus).lowercased()
+        if base.contains("retrying") || base.contains("stale session") {
+            return "Still retrying session startup (\(idleFor)s without new output)."
+        }
+        if base.contains("running command") {
+            return "Command is still running (\(idleFor)s without new output)."
+        }
+        if base.contains("validation") {
+            return "Validation is still in progress (\(idleFor)s without new output)."
+        }
+        if base.contains("pushing") {
+            return "Push is still in progress (\(idleFor)s without new output)."
+        }
+        return "Still working in the project (\(idleFor)s without new output)."
+    }
+
+    private func statusWithoutElapsedSuffix(_ value: String) -> String {
+        value
+            .replacingOccurrences(
+                of: "\\s*\\([0-9]+s\\)$",
+                with: "",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func updateThinkingProgress(from rawValue: String) {
         guard isBusy else { return }
         guard let status = summarizedProgressLine(from: rawValue) else { return }
         thinkingStatus = status
+        lastProgressAt = Date()
 
         if thinkingHighlights.last != status {
             thinkingHighlights.append(status)
@@ -2748,12 +2826,23 @@ struct ContentView: View {
     }
 
     private var visibleThinkingHighlights: [String] {
-        let current = viewModel.thinkingStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let current = normalizedStatusForComparison(viewModel.thinkingStatus)
         let filtered = viewModel.thinkingHighlights.filter { item in
-            let normalized = item.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let normalized = normalizedStatusForComparison(item)
             return !normalized.isEmpty && normalized != current
         }
         return Array(filtered.suffix(3))
+    }
+
+    private func normalizedStatusForComparison(_ value: String) -> String {
+        value
+            .replacingOccurrences(
+                of: "\\s*\\([0-9]+s(?:\\s+without\\s+new\\s+output)?\\)$",
+                with: "",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
     }
 
     private var conversationPanel: some View {
