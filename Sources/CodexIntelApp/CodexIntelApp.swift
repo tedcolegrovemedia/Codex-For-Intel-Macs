@@ -2654,6 +2654,15 @@ struct ContentView: View {
         return "Select a project folder to start Codex."
     }
 
+    private var visibleThinkingHighlights: [String] {
+        let current = viewModel.thinkingStatus.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let filtered = viewModel.thinkingHighlights.filter { item in
+            let normalized = item.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return !normalized.isEmpty && normalized != current
+        }
+        return Array(filtered.suffix(3))
+    }
+
     private var conversationPanel: some View {
         VStack(spacing: 12) {
             HStack {
@@ -2688,9 +2697,9 @@ struct ContentView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
-                    if viewModel.isBusy, !viewModel.thinkingHighlights.isEmpty {
+                    if viewModel.isBusy, !visibleThinkingHighlights.isEmpty {
                         VStack(alignment: .leading, spacing: 3) {
-                            ForEach(Array(viewModel.thinkingHighlights.suffix(3).enumerated()), id: \.offset) { _, item in
+                            ForEach(Array(visibleThinkingHighlights.enumerated()), id: \.offset) { _, item in
                                 Text("• \(item)")
                                     .font(.caption2)
                                     .foregroundColor(.secondary)
