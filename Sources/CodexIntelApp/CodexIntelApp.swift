@@ -450,6 +450,7 @@ final class AppViewModel: ObservableObject {
     private var currentRunAssistantDeltas = ""
     private var currentRunAssistantCompletions: [String] = []
     private var detectedStaleSessionErrorInCurrentRun = false
+    private let genericDoneFallback = "Completed. I applied updates to your project and summarized the result."
 
     init() {
         applyModelDefaultsFromConfig()
@@ -671,10 +672,11 @@ final class AppViewModel: ObservableObject {
             appendActivity("Codex response complete")
             thinkingStatus = ""
             await refreshChangeSummary()
+            let doneSummary = resolvedDoneSummary(responseSummary)
             let validation = await runAutomaticValidationIfPossible()
             let pushOutcome = await autoCommitAndPushAfterChat()
             let summary = buildPostRunSummary(
-                doneSummary: responseSummary,
+                doneSummary: doneSummary,
                 duration: Date().timeIntervalSince(runStartedAt),
                 validation: validation,
                 push: pushOutcome
@@ -1264,6 +1266,36 @@ final class AppViewModel: ObservableObject {
         return values
     }
 
+    private func resolvedDoneSummary(_ summary: String) -> String {
+        let normalized = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalized.isEmpty, normalized != genericDoneFallback {
+            return normalized
+        }
+        return generatedSummaryFromChanges()
+    }
+
+    private func generatedSummaryFromChanges() -> String {
+        if latestDiffFiles.isEmpty {
+            return "No file edits were detected in this run."
+        }
+
+        let fileCount = latestDiffFiles.count
+        let topFileNames = latestDiffFiles
+            .prefix(3)
+            .map { URL(fileURLWithPath: $0.path).lastPathComponent }
+            .filter { !$0.isEmpty }
+        let fileLabel = fileCount == 1 ? "file" : "files"
+
+        var summary = "Updated \(fileCount) \(fileLabel)"
+        if !topFileNames.isEmpty {
+            summary += " including \(topFileNames.joined(separator: ", "))"
+        }
+        if latestDiffAdded > 0 || latestDiffRemoved > 0 {
+            summary += " with line changes of +\(latestDiffAdded)/-\(latestDiffRemoved)"
+        }
+        return summary + "."
+    }
+
     private func formattedElapsedDuration(_ duration: TimeInterval) -> String {
         let seconds = max(1, Int(duration.rounded()))
         let minutes = seconds / 60
@@ -1603,7 +1635,7 @@ final class AppViewModel: ObservableObject {
 
         let summary = summarizePlainEnglish(sanitized)
         if summary.isEmpty {
-            return "Completed. I applied updates to your project and summarized the result."
+            return genericDoneFallback
         }
         return summary
     }
