@@ -211,6 +211,7 @@ final class AppViewModel: ObservableObject {
     private let runner = ShellRunner()
     private var resolvedCodexExecutable: String?
     private var didAttemptAutoInstallCodex = false
+    private var didCompleteDependencySetup = false
     private let missingBrewMarker = "__BREW_MISSING__"
     var isGitConfigured: Bool {
         !gitRemote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
@@ -228,6 +229,12 @@ final class AppViewModel: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url {
             projectPath = url.path
             log("Selected project: \(projectPath)")
+            Task {
+                await ensureProjectDirectoryAccess()
+                if !didCompleteDependencySetup {
+                    await runDependencyInstaller(autoTriggered: true)
+                }
+            }
         }
     }
 
@@ -267,12 +274,6 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    func installDependencies() {
-        Task {
-            await runDependencyInstaller()
-        }
-    }
-
     func gitPush() {
         guard let target = configuredGitTarget() else { return }
         let pushCommand = "git push \(shellQuote(target.remote)) \(shellQuote(target.branch))"
@@ -306,11 +307,17 @@ final class AppViewModel: ObservableObject {
         do {
             try validateProjectAndTemplate(prompt: userPrompt)
             let codexExecutable = try await ensureCodexExecutableAvailable()
+            await ensureProjectDirectoryAccess()
             let enrichedPrompt = buildPromptWithHistory(newPrompt: userPrompt)
+            var codexArguments: [String] = ["exec"]
+            if !isGitConfigured {
+                codexArguments.append("--skip-git-repo-check")
+            }
+            codexArguments.append(enrichedPrompt)
             let output = try await executeBusyExecutable(
                 label: "Running Codex",
                 executablePath: codexExecutable,
-                arguments: ["exec", enrichedPrompt]
+                arguments: codexArguments
             )
             if output.exitCode != 0 {
                 log("Codex exited with code \(output.exitCode)")
@@ -561,6 +568,7 @@ final class AppViewModel: ObservableObject {
     }
 
     private func autoCommitAndPushAfterChat() async {
+        guard isGitConfigured else { return }
         let project = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !project.isEmpty else { return }
         guard let target = configuredGitTarget() else { return }
@@ -588,19 +596,28 @@ final class AppViewModel: ObservableObject {
     private func configuredGitTarget() -> (remote: String, branch: String)? {
         let remote = gitRemote.trimmingCharacters(in: .whitespacesAndNewlines)
         let branch = gitBranch.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !remote.isEmpty && !branch.isEmpty else {
-            log("Git skipped: fill both Remote and Branch to enable git actions.")
-            return nil
-        }
+        guard !remote.isEmpty && !branch.isEmpty else { return nil }
         return (remote, branch)
     }
 
-    private func runDependencyInstaller() async {
+    private func ensureProjectDirectoryAccess() async {
+        let path = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { return }
+        let output = try? await runner.run(
+            command: "chmod u+rwx \(shellQuote(path))",
+            workingDirectory: nil
+        )
+        if let output, output.exitCode == 0 {
+            log("Ensured directory permissions for project.")
+        }
+    }
+
+    private func runDependencyInstaller(autoTriggered: Bool = false) async {
         let command = dependencyInstallScript(includeExtras: true)
 
         do {
             let output = try await executeBusyCommand(
-                label: "Installing dependencies",
+                label: autoTriggered ? "Auto setup dependencies" : "Installing dependencies",
                 command: command,
                 workingDirectory: nil
             )
@@ -614,9 +631,13 @@ final class AppViewModel: ObservableObject {
                 log("Dependency setup failed with code \(output.exitCode): \(details)")
                 return
             }
+            didCompleteDependencySetup = true
             resolvedCodexExecutable = nil
             let details = cleanOutput(output.stdout, fallback: output.stderr)
-            messages.append(ChatMessage(role: .system, content: "Dependency setup complete.\n\(details)"))
+            let completionMessage = autoTriggered
+                ? "Automatic dependency setup complete.\n\(details)"
+                : "Dependency setup complete.\n\(details)"
+            messages.append(ChatMessage(role: .system, content: completionMessage))
             log("Dependency setup completed.")
         } catch {
             let text = error.localizedDescription
@@ -747,10 +768,6 @@ struct ContentView: View {
                         }
                         Button("Locate Codex") {
                             viewModel.chooseCodexBinary()
-                        }
-                        .disabled(viewModel.isBusy)
-                        Button("Setup Dependencies") {
-                            viewModel.installDependencies()
                         }
                         .disabled(viewModel.isBusy)
                         Button("Open in VS Code") {
