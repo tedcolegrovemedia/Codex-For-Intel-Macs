@@ -1219,12 +1219,10 @@ final class AppViewModel: ObservableObject {
         lines.append("")
         lines.append("Done. \(doneSummary)")
 
-        let changedFiles = changedFileReferenceLines(limit: 6)
-        if !changedFiles.isEmpty {
-            lines.append("")
-            for value in changedFiles {
-                lines.append("• \(value)")
-            }
+        lines.append("")
+        lines.append("Changes:")
+        for value in changedFileReferenceLines(limit: 8) {
+            lines.append("• \(value)")
         }
 
         lines.append("")
@@ -1240,7 +1238,9 @@ final class AppViewModel: ObservableObject {
     }
 
     private func changedFileReferenceLines(limit: Int) -> [String] {
-        guard !latestDiffFiles.isEmpty else { return [] }
+        guard !latestDiffFiles.isEmpty else {
+            return ["No file edits were detected in this run."]
+        }
 
         var firstLineByFile: [String: Int] = [:]
         for line in latestDiffLines {
@@ -1252,10 +1252,12 @@ final class AppViewModel: ObservableObject {
 
         var values: [String] = []
         for file in latestDiffFiles.prefix(limit) {
+            let compactPath = compactSummaryPath(file.path)
+            let stats = "+\(file.added)/-\(file.removed)"
             if let line = firstLineByFile[file.path] {
-                values.append("\(file.path) (line \(line))")
+                values.append("\(compactPath) (line \(line), \(stats))")
             } else {
-                values.append(file.path)
+                values.append("\(compactPath) (\(stats))")
             }
         }
 
@@ -1268,10 +1270,15 @@ final class AppViewModel: ObservableObject {
 
     private func resolvedDoneSummary(_ summary: String) -> String {
         let normalized = summary.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !normalized.isEmpty, normalized != genericDoneFallback {
-            return normalized
+        let generated = generatedSummaryFromChanges()
+
+        if normalized.isEmpty || normalized == genericDoneFallback {
+            return generated
         }
-        return generatedSummaryFromChanges()
+        if doneSummaryNeedsMoreDetail(normalized) {
+            return "\(normalized) \(generated)"
+        }
+        return normalized
     }
 
     private func generatedSummaryFromChanges() -> String {
@@ -1280,20 +1287,37 @@ final class AppViewModel: ObservableObject {
         }
 
         let fileCount = latestDiffFiles.count
-        let topFileNames = latestDiffFiles
-            .prefix(3)
-            .map { URL(fileURLWithPath: $0.path).lastPathComponent }
-            .filter { !$0.isEmpty }
         let fileLabel = fileCount == 1 ? "file" : "files"
+        let topFileSummaries = latestDiffFiles.prefix(5).map { file in
+            "\(compactSummaryPath(file.path)) (+\(file.added)/-\(file.removed))"
+        }
 
         var summary = "Updated \(fileCount) \(fileLabel)"
-        if !topFileNames.isEmpty {
-            summary += " including \(topFileNames.joined(separator: ", "))"
+        if !topFileSummaries.isEmpty {
+            summary += ": \(topFileSummaries.joined(separator: "; "))"
         }
-        if latestDiffAdded > 0 || latestDiffRemoved > 0 {
-            summary += " with line changes of +\(latestDiffAdded)/-\(latestDiffRemoved)"
+        if fileCount > topFileSummaries.count {
+            summary += "; +\(fileCount - topFileSummaries.count) more file(s)"
         }
         return summary + "."
+    }
+
+    private func doneSummaryNeedsMoreDetail(_ summary: String) -> Bool {
+        let words = summary.split(whereSeparator: \.isWhitespace).count
+        if words < 18 {
+            return true
+        }
+        let lowered = summary.lowercased()
+        if lowered.contains("file") || lowered.contains("files") || lowered.contains("changed") || lowered.contains("updated") {
+            return false
+        }
+        return true
+    }
+
+    private func compactSummaryPath(_ path: String) -> String {
+        let components = path.split(separator: "/").map(String.init)
+        guard components.count > 3 else { return path }
+        return components.suffix(3).joined(separator: "/")
     }
 
     private func formattedElapsedDuration(_ duration: TimeInterval) -> String {
@@ -2116,38 +2140,8 @@ struct ContentView: View {
             .modifier(TopBarFlatChip())
 
             Spacer()
-
-            HStack(spacing: 8) {
-                Text("Model")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-
-                Picker("Model", selection: $viewModel.selectedModel) {
-                    ForEach(viewModel.availableModels, id: \.self) { model in
-                        Text(model).tag(model)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(width: 180)
-            }
-            .modifier(TopBarFlatChip())
-
-            HStack(spacing: 8) {
-                Text("Reasoning")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-
-                Picker("Reasoning", selection: $viewModel.selectedReasoningEffort) {
-                    ForEach(viewModel.availableReasoningEfforts, id: \.self) { effort in
-                        Text(viewModel.reasoningDisplayName(for: effort)).tag(effort)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(width: 130)
-            }
-            .modifier(TopBarFlatChip())
+            modelSelectionChip
+            reasoningSelectionChip
 
             Text(viewModel.codexCliVersion)
                 .font(.caption2)
@@ -2164,6 +2158,68 @@ struct ContentView: View {
         .onChange(of: viewModel.selectedReasoningEffort) { _ in
             viewModel.reasoningSelectionDidChange()
         }
+    }
+
+    private var modelSelectionChip: some View {
+        Menu {
+            ForEach(viewModel.availableModels, id: \.self) { model in
+                Button {
+                    viewModel.selectedModel = model
+                } label: {
+                    if model == viewModel.selectedModel {
+                        Label(model, systemImage: "checkmark")
+                    } else {
+                        Text(model)
+                    }
+                }
+            }
+        } label: {
+            topBarSelectionLabel(title: "Model", value: viewModel.selectedModel, width: 180)
+        }
+        .menuStyle(.borderlessButton)
+        .buttonStyle(.plain)
+    }
+
+    private var reasoningSelectionChip: some View {
+        Menu {
+            ForEach(viewModel.availableReasoningEfforts, id: \.self) { effort in
+                Button {
+                    viewModel.selectedReasoningEffort = effort
+                } label: {
+                    let display = viewModel.reasoningDisplayName(for: effort)
+                    if effort == viewModel.selectedReasoningEffort {
+                        Label(display, systemImage: "checkmark")
+                    } else {
+                        Text(display)
+                    }
+                }
+            }
+        } label: {
+            topBarSelectionLabel(
+                title: "Reasoning",
+                value: viewModel.reasoningDisplayName(for: viewModel.selectedReasoningEffort),
+                width: 130
+            )
+        }
+        .menuStyle(.borderlessButton)
+        .buttonStyle(.plain)
+    }
+
+    private func topBarSelectionLabel(title: String, value: String, width: CGFloat) -> some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text(value)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(width: width, alignment: .leading)
+            Image(systemName: "chevron.down")
+                .font(.caption2.weight(.semibold))
+                .foregroundColor(.secondary)
+        }
+        .modifier(TopBarFlatChip())
     }
 
     private var controlPanel: some View {
