@@ -2438,10 +2438,7 @@ struct ContentView: View {
 
     private func topBarSelectionLabel(title: String, value: String, width: CGFloat) -> some View {
         HStack(spacing: 8) {
-            Text(title)
-                .font(.caption)
-                .foregroundColor(.secondary)
-            Text(value)
+            Text("\(title): \(value)")
                 .font(.caption.weight(.semibold))
                 .lineLimit(1)
                 .truncationMode(.tail)
