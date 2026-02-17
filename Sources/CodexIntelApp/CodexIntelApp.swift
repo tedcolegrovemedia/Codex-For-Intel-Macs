@@ -13,17 +13,29 @@ struct CodexIntelApp: App {
     }
 }
 
-enum MessageRole: String {
+enum MessageRole: String, Codable {
     case user = "User"
     case assistant = "Codex"
     case system = "System"
 }
 
-struct ChatMessage: Identifiable {
-    let id = UUID()
+struct ChatMessage: Identifiable, Codable {
+    let id: UUID
     let role: MessageRole
     let content: String
-    let timestamp = Date()
+    let timestamp: Date
+
+    init(
+        id: UUID = UUID(),
+        role: MessageRole,
+        content: String,
+        timestamp: Date = Date()
+    ) {
+        self.id = id
+        self.role = role
+        self.content = content
+        self.timestamp = timestamp
+    }
 }
 
 struct CommandOutput {
@@ -471,7 +483,11 @@ final class AppViewModel: ObservableObject {
             role: .system,
             content: "Select a project folder, then send prompts. Codex runs in autonomous edit mode in that directory."
         )
-    ]
+    ] {
+        didSet {
+            persistConversationHistoryIfNeeded()
+        }
+    }
     @Published var commandLog: [String] = []
     @Published var isBusy = false
     @Published var busyLabel = ""
@@ -497,6 +513,7 @@ final class AppViewModel: ObservableObject {
     private var stopRequested = false
     private var didReportStopForCurrentRun = false
     private var fallbackChangedFiles: [String] = []
+    private var preRunTextSnapshots: [String: String] = [:]
     private var loginFlowOpenedBrowser = false
     private var loginFlowSawDeviceCodePrompt = false
     private var runHeartbeatTask: Task<Void, Never>?
@@ -505,6 +522,8 @@ final class AppViewModel: ObservableObject {
     private let genericDoneFallback = "Completed. I applied updates to your project and summarized the result."
     private let recentProjectsDefaultsKey = "CodexIntelAppRecentProjects"
     private let maxRecentProjectsCount = 12
+    private let maxPersistedConversationMessages = 400
+    private var suppressConversationPersistence = false
 
     init() {
         loadRecentProjects()
@@ -557,6 +576,7 @@ final class AppViewModel: ObservableObject {
     private func activateProject(_ path: String, installDependencies: Bool) {
         projectPath = path
         addRecentProject(path)
+        loadConversationHistory(for: path)
         resetSession(reason: nil)
         log("Selected project: \(projectPath)")
         Task {
@@ -600,6 +620,118 @@ final class AppViewModel: ObservableObject {
         }
         recentProjects = updated
         saveRecentProjects()
+    }
+
+    private func loadConversationHistory(for project: String) {
+        let value = project.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else {
+            replaceConversationMessages(with: [
+                ChatMessage(
+                    role: .system,
+                    content: "Select a project folder, then send prompts. Codex runs in autonomous edit mode in that directory."
+                )
+            ])
+            return
+        }
+
+        guard let url = conversationFileURL(for: value, createDirectory: false) else {
+            replaceConversationMessages(with: [
+                ChatMessage(
+                    role: .system,
+                    content: "Select a project folder, then send prompts. Codex runs in autonomous edit mode in that directory."
+                )
+            ])
+            return
+        }
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            replaceConversationMessages(with: [
+                ChatMessage(
+                    role: .system,
+                    content: "Project loaded. Start chatting to create project-specific history."
+                )
+            ])
+            return
+        }
+
+        do {
+            let data = try Data(contentsOf: url)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let decoded = try decoder.decode([ChatMessage].self, from: data)
+            if decoded.isEmpty {
+                replaceConversationMessages(with: [
+                    ChatMessage(
+                        role: .system,
+                        content: "Project loaded. Start chatting to create project-specific history."
+                    )
+                ])
+            } else {
+                replaceConversationMessages(with: decoded)
+            }
+            log("Loaded conversation history for project.")
+        } catch {
+            replaceConversationMessages(with: [
+                ChatMessage(
+                    role: .system,
+                    content: "Project loaded. Start chatting to create project-specific history."
+                )
+            ])
+            log("Unable to load conversation history: \(error.localizedDescription)")
+        }
+    }
+
+    private func replaceConversationMessages(with newMessages: [ChatMessage]) {
+        suppressConversationPersistence = true
+        messages = newMessages
+        suppressConversationPersistence = false
+    }
+
+    private func persistConversationHistoryIfNeeded() {
+        guard !suppressConversationPersistence else { return }
+        let project = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !project.isEmpty else { return }
+        guard let url = conversationFileURL(for: project, createDirectory: true) else { return }
+
+        do {
+            let trimmed = Array(messages.suffix(maxPersistedConversationMessages))
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.withoutEscapingSlashes]
+            encoder.dateEncodingStrategy = .iso8601
+            let data = try encoder.encode(trimmed)
+            try data.write(to: url, options: [.atomic])
+        } catch {
+            log("Unable to persist conversation history: \(error.localizedDescription)")
+        }
+    }
+
+    private func conversationFileURL(for project: String, createDirectory: Bool) -> URL? {
+        let fm = FileManager.default
+        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
+        let directory = base
+            .appendingPathComponent("CodexIntelApp", isDirectory: true)
+            .appendingPathComponent("Conversations", isDirectory: true)
+
+        if createDirectory {
+            do {
+                try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            } catch {
+                log("Unable to create conversation history directory: \(error.localizedDescription)")
+                return nil
+            }
+        }
+
+        let fileName = safeConversationFileName(for: project)
+        return directory.appendingPathComponent(fileName, isDirectory: false)
+    }
+
+    private func safeConversationFileName(for project: String) -> String {
+        let encoded = Data(project.utf8).base64EncodedString()
+        let safe = encoded
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "=", with: "")
+        return "\(safe).json"
     }
 
     func chooseCodexBinary() {
@@ -750,6 +882,7 @@ final class AppViewModel: ObservableObject {
         do {
             try validateProjectAndTemplate(prompt: userPrompt)
             let gitSnapshot = await captureGitRunSnapshot()
+            capturePreRunTextSnapshots()
             let codexExecutable = try await ensureCodexExecutableAvailable()
             await ensureProjectDirectoryTrustAndAccess()
             if finalizeStopIfNeeded() { return }
@@ -812,6 +945,7 @@ final class AppViewModel: ObservableObject {
                     captureFilesystemChangeFallback(since: runStartedAt)
                 }
             }
+            await enrichFallbackChangeSummaryDetailsIfNeeded()
             if finalizeStopIfNeeded() { return }
             let doneSummary = resolvedDoneSummary(responseSummary)
             let validation = await runAutomaticValidationIfPossible()
@@ -2041,6 +2175,7 @@ final class AppViewModel: ObservableObject {
         latestDiffFiles.removeAll()
         latestDiffLines.removeAll()
         fallbackChangedFiles.removeAll()
+        preRunTextSnapshots.removeAll()
         showChangesAccordion = false
         detectedStaleSessionErrorInCurrentRun = false
         didReportStopForCurrentRun = false
@@ -2699,6 +2834,147 @@ final class AppViewModel: ObservableObject {
         fallbackChangedFiles = Array(Set(found)).sorted()
         if !fallbackChangedFiles.isEmpty {
             appendActivity("Filesystem fallback detected \(fallbackChangedFiles.count) changed file(s).")
+        }
+    }
+
+    private func capturePreRunTextSnapshots() {
+        preRunTextSnapshots.removeAll()
+
+        let rootPath = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rootPath.isEmpty else { return }
+
+        let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true)
+        let resourceKeys: Set<URLResourceKey> = [
+            .isRegularFileKey,
+            .fileSizeKey
+        ]
+        guard let enumerator = FileManager.default.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: Array(resourceKeys),
+            options: [.skipsPackageDescendants, .skipsHiddenFiles]
+        ) else {
+            return
+        }
+
+        let excludedPrefixes = [
+            ".git/",
+            ".build/",
+            "dist/",
+            "node_modules/",
+            ".swiftpm/",
+            "DerivedData/",
+            "Library/"
+        ]
+
+        var fileCount = 0
+        var capturedBytes = 0
+        let maxFiles = 450
+        let maxTotalBytes = 6_000_000
+        let maxFileBytes = 180_000
+
+        while let fileURL = enumerator.nextObject() as? URL {
+            guard fileCount < maxFiles else { break }
+            guard capturedBytes < maxTotalBytes else { break }
+            guard let values = try? fileURL.resourceValues(forKeys: resourceKeys) else { continue }
+            guard values.isRegularFile == true else { continue }
+            let size = values.fileSize ?? 0
+            guard size > 0, size <= maxFileBytes else { continue }
+
+            var relativePath = fileURL.path
+            if relativePath.hasPrefix(rootURL.path) {
+                relativePath = String(relativePath.dropFirst(rootURL.path.count))
+                if relativePath.hasPrefix("/") {
+                    relativePath.removeFirst()
+                }
+            }
+            guard !relativePath.isEmpty else { continue }
+            guard !excludedPrefixes.contains(where: { relativePath.hasPrefix($0) }) else { continue }
+
+            guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
+
+            preRunTextSnapshots[relativePath] = text
+            fileCount += 1
+            capturedBytes += size
+        }
+    }
+
+    private func enrichFallbackChangeSummaryDetailsIfNeeded() async {
+        guard !fallbackChangedFiles.isEmpty else { return }
+        if hasMeaningfulDiffStats(), !latestDiffLines.isEmpty {
+            return
+        }
+
+        let maxFiles = 6
+        var derivedStats: [String: (added: Int, removed: Int)] = [:]
+        var derivedLines: [DiffLine] = []
+
+        for path in fallbackChangedFiles.prefix(maxFiles) {
+            guard let value = await deriveFallbackDiff(for: path) else { continue }
+            if value.added > 0 || value.removed > 0 || !value.lines.isEmpty {
+                derivedStats[path] = (value.added, value.removed)
+            }
+            if !value.lines.isEmpty, derivedLines.count < 220 {
+                let remaining = max(0, 220 - derivedLines.count)
+                derivedLines.append(contentsOf: value.lines.prefix(remaining))
+            }
+        }
+
+        guard !derivedStats.isEmpty else { return }
+
+        let combined = fallbackChangedFiles.map { path in
+            let stats = derivedStats[path] ?? (0, 0)
+            return DiffFileStat(path: path, added: stats.added, removed: stats.removed)
+        }
+
+        latestDiffFiles = combined
+        latestDiffAdded = combined.reduce(0) { $0 + $1.added }
+        latestDiffRemoved = combined.reduce(0) { $0 + $1.removed }
+        if !derivedLines.isEmpty {
+            latestDiffLines = derivedLines
+        }
+        appendActivity("Derived line-level fallback changes for \(derivedStats.count) file(s).")
+    }
+
+    private func deriveFallbackDiff(for relativePath: String) async -> (added: Int, removed: Int, lines: [DiffLine])? {
+        let rootPath = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rootPath.isEmpty else { return nil }
+
+        let beforeText = preRunTextSnapshots[relativePath] ?? ""
+        let fileURL = URL(fileURLWithPath: rootPath, isDirectory: true).appendingPathComponent(relativePath)
+        let afterText = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
+
+        if beforeText == afterText {
+            return nil
+        }
+
+        let temporaryDirectory = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        let oldURL = temporaryDirectory.appendingPathComponent("codexintel-before-\(UUID().uuidString).txt")
+        let newURL = temporaryDirectory.appendingPathComponent("codexintel-after-\(UUID().uuidString).txt")
+        do {
+            try beforeText.write(to: oldURL, atomically: true, encoding: .utf8)
+            try afterText.write(to: newURL, atomically: true, encoding: .utf8)
+            defer {
+                try? FileManager.default.removeItem(at: oldURL)
+                try? FileManager.default.removeItem(at: newURL)
+            }
+
+            let command = "git diff --no-index --no-color --unified=0 -- \(shellQuote(oldURL.path)) \(shellQuote(newURL.path)) || true"
+            guard let patchOutput = try? await runner.run(command: command, workingDirectory: nil) else {
+                return nil
+            }
+
+            var patchText = patchOutput.stdout
+            patchText = patchText.replacingOccurrences(of: "a\(oldURL.path)", with: "a/\(relativePath)")
+            patchText = patchText.replacingOccurrences(of: "b\(newURL.path)", with: "b/\(relativePath)")
+
+            let fullLines = parseDiffLines(patchText, limit: 8_000).filter { $0.file == relativePath }
+            let added = fullLines.filter { $0.kind == .added }.count
+            let removed = fullLines.filter { $0.kind == .removed }.count
+            let preview = Array(fullLines.prefix(80))
+
+            return (added: added, removed: removed, lines: preview)
+        } catch {
+            return nil
         }
     }
 
