@@ -2574,6 +2574,7 @@ struct ContentView: View {
         } label: {
             topBarSelectionLabel(title: "Model", value: viewModel.selectedModel, width: 180)
         }
+        .menuIndicator(.hidden)
         .menuStyle(.borderlessButton)
         .buttonStyle(.plain)
     }
@@ -2599,6 +2600,7 @@ struct ContentView: View {
                 width: 130
             )
         }
+        .menuIndicator(.hidden)
         .menuStyle(.borderlessButton)
         .buttonStyle(.plain)
     }
