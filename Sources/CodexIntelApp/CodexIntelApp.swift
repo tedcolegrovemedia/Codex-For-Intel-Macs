@@ -449,6 +449,7 @@ final class AppViewModel: ObservableObject {
     @Published var projectPath = ""
     @Published var codexPathOverride = ""
     @Published var codexCliVersion = "Detecting..."
+    @Published var codexAccountStatus = "Checking..."
     @Published var codexSessionState = "Not started"
     @Published var selectedModel = "gpt-5.3-codex"
     @Published var selectedReasoningEffort = "xhigh"
@@ -506,6 +507,7 @@ final class AppViewModel: ObservableObject {
         updateReasoningOptionsForSelectedModel()
         Task {
             await refreshCodexVersion()
+            await refreshCodexAccountStatus()
         }
     }
 
@@ -616,6 +618,18 @@ final class AppViewModel: ObservableObject {
                 command: "if command -v code >/dev/null 2>&1; then code .; else open -a \"Visual Studio Code\" .; fi",
                 includeAsAssistantMessage: false
             )
+        }
+    }
+
+    func connectChatGPTAccount() {
+        Task {
+            await openCodexLoginInTerminal()
+        }
+    }
+
+    func refreshAccountStatus() {
+        Task {
+            await refreshCodexAccountStatus()
         }
     }
 
@@ -1052,6 +1066,78 @@ final class AppViewModel: ObservableObject {
         }
         let version = cleanOutput(output.stdout, fallback: output.stderr)
         codexCliVersion = version.replacingOccurrences(of: "\n", with: " ")
+    }
+
+    private func refreshCodexAccountStatus() async {
+        let command = """
+        if ! command -v codex >/dev/null 2>&1; then
+          echo "__CODEX_NOT_FOUND__"
+          exit 0
+        fi
+        codex whoami 2>/dev/null || codex auth whoami 2>/dev/null || codex auth status 2>/dev/null || true
+        """
+
+        guard let output = try? await runner.run(command: command, workingDirectory: nil) else {
+            codexAccountStatus = "Unavailable"
+            return
+        }
+        codexAccountStatus = parseCodexAccountStatus(stdout: output.stdout, stderr: output.stderr)
+    }
+
+    private func parseCodexAccountStatus(stdout: String, stderr: String) -> String {
+        let combined = (stdout + "\n" + stderr).trimmingCharacters(in: .whitespacesAndNewlines)
+        if combined.contains("__CODEX_NOT_FOUND__") {
+            return "CLI not found"
+        }
+        let lowered = combined.lowercased()
+        if lowered.contains("not logged") || lowered.contains("unauthorized") || lowered.contains("sign in") {
+            return "Not connected"
+        }
+
+        let lines = combined
+            .split(separator: "\n")
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if let first = lines.first {
+            if first.count <= 80 {
+                return first
+            }
+            return String(first.prefix(80)) + "..."
+        }
+        return "Unknown"
+    }
+
+    private func openCodexLoginInTerminal() async {
+        let command = """
+        if command -v codex >/dev/null 2>&1; then
+          osascript -e 'tell application "Terminal" to activate' -e 'tell application "Terminal" to do script "codex login"'
+        else
+          echo "Codex CLI not found."
+          exit 127
+        fi
+        """
+
+        do {
+            let output = try await executeBusyCommand(
+                label: "Open Codex Login",
+                command: command,
+                workingDirectory: nil
+            )
+            if output.exitCode == 0 {
+                messages.append(
+                    ChatMessage(
+                        role: .system,
+                        content: "Opened Terminal for `codex login`. Complete sign-in there, then click Refresh Account Status."
+                    )
+                )
+                appendActivity("Opened Terminal for Codex login.")
+            } else {
+                let details = conversationSafePlainEnglish(preferredFailureText(output))
+                messages.append(ChatMessage(role: .system, content: "Unable to open login flow: \(details)"))
+            }
+        } catch {
+            messages.append(ChatMessage(role: .system, content: "Unable to open login flow: \(error.localizedDescription)"))
+        }
     }
 
     private func applyModelDefaultsFromConfig() {
@@ -2580,6 +2666,15 @@ struct ContentView: View {
                     viewModel.openInVSCode()
                 }
                 .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy)
+                Divider()
+                Button("Connect ChatGPT Account") {
+                    viewModel.connectChatGPTAccount()
+                }
+                .disabled(viewModel.isBusy)
+                Button("Refresh Account Status") {
+                    viewModel.refreshAccountStatus()
+                }
+                .disabled(viewModel.isBusy)
             } label: {
                 topBarFlatLabel("Project", systemImage: "folder")
             }
@@ -2602,6 +2697,13 @@ struct ContentView: View {
             reasoningSelectionChip
 
             Text(viewModel.codexCliVersion)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .textSelection(.enabled)
+                .frame(maxWidth: 220, alignment: .trailing)
+
+            Text("Account: \(viewModel.codexAccountStatus)")
                 .font(.caption2)
                 .foregroundColor(.secondary)
                 .lineLimit(1)
@@ -2690,6 +2792,9 @@ struct ContentView: View {
                         .foregroundColor(.secondary)
                         .textSelection(.enabled)
                     Text("Session: \(viewModel.codexSessionState)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Text("Account: \(viewModel.codexAccountStatus)")
                         .font(.caption)
                         .foregroundColor(.secondary)
                     Text("Current: \(viewModel.currentModelSummary)")
@@ -2896,6 +3001,16 @@ struct ContentView: View {
         return Array(filtered.suffix(3))
     }
 
+    private var latestAssistantMessageID: UUID? {
+        viewModel.messages.last(where: { $0.role == .assistant })?.id
+    }
+
+    private func inlineChangeData(for message: ChatMessage) -> (files: [DiffFileStat], lines: [DiffLine]) {
+        guard message.role == .assistant else { return ([], []) }
+        guard message.id == latestAssistantMessageID else { return ([], []) }
+        return (viewModel.latestDiffFiles, viewModel.latestDiffLines)
+    }
+
     private func normalizedStatusForComparison(_ value: String) -> String {
         value
             .replacingOccurrences(
@@ -2921,7 +3036,12 @@ struct ContentView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
                         ForEach(viewModel.messages) { message in
-                            MessageBubble(message: message)
+                            let inline = inlineChangeData(for: message)
+                            MessageBubble(
+                                message: message,
+                                inlineDiffFiles: inline.files,
+                                inlineDiffLines: inline.lines
+                            )
                         }
                     }
                     .padding(16)
@@ -3068,7 +3188,10 @@ private func topBarFlatLabel(_ text: String, systemImage: String? = nil) -> some
 
 struct MessageBubble: View {
     let message: ChatMessage
+    let inlineDiffFiles: [DiffFileStat]
+    let inlineDiffLines: [DiffLine]
     @State private var expanded = false
+    @State private var showInlineChanges = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -3086,6 +3209,53 @@ struct MessageBubble: View {
                 .textSelection(.enabled)
                 .lineLimit(shouldCollapse ? 2 : nil)
                 .frame(maxWidth: .infinity, alignment: .leading)
+
+            if hasInlineDiff {
+                Button(showInlineChanges ? "Hide changes" : "Show changes") {
+                    showInlineChanges.toggle()
+                }
+                .buttonStyle(.plain)
+                .font(.caption2.weight(.semibold))
+                .foregroundColor(.secondary)
+
+                if showInlineChanges {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(inlineDiffFiles.prefix(6)) { file in
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack(spacing: 8) {
+                                    Text(file.path)
+                                        .font(.caption2.weight(.semibold))
+                                        .lineLimit(1)
+                                    Spacer(minLength: 4)
+                                    Text("+\(file.added)")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundColor(.green)
+                                    Text("-\(file.removed)")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundColor(.red)
+                                }
+
+                                let rows = linePreviewForFile(file.path, limit: 20)
+                                if rows.isEmpty {
+                                    Text("No line preview available.")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                } else {
+                                    VStack(spacing: 0) {
+                                        ForEach(rows) { row in
+                                            inlineDiffRow(row)
+                                        }
+                                    }
+                                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                                }
+                            }
+                            .padding(8)
+                            .background(Color(nsColor: .controlBackgroundColor))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                        }
+                    }
+                }
+            }
 
             if canCollapse {
                 Button(expanded ? "Show less" : "Show details") {
@@ -3130,5 +3300,40 @@ struct MessageBubble: View {
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return collapsed.isEmpty ? message.content : collapsed
+    }
+
+    private var hasInlineDiff: Bool {
+        message.role == .assistant && !inlineDiffFiles.isEmpty
+    }
+
+    private func linePreviewForFile(_ path: String, limit: Int) -> [DiffLine] {
+        Array(inlineDiffLines.filter { $0.file == path }.prefix(limit))
+    }
+
+    private func inlineDiffRow(_ line: DiffLine) -> some View {
+        let isAdded = line.kind == .added
+        let sign = isAdded ? "+" : "-"
+
+        return HStack(spacing: 0) {
+            Text(line.lineNumber.map(String.init) ?? "·")
+                .font(.system(size: 10, weight: .regular, design: .monospaced))
+                .foregroundColor(.secondary)
+                .frame(width: 44, alignment: .trailing)
+                .padding(.trailing, 6)
+                .padding(.vertical, 1)
+                .background(Color.black.opacity(0.14))
+
+            HStack(spacing: 4) {
+                Text(sign)
+                    .font(.system(size: 10, weight: .bold, design: .monospaced))
+                    .foregroundColor(isAdded ? .green : .red)
+                Text(line.text.isEmpty ? " " : line.text)
+                    .font(.system(size: 11, weight: .regular, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1)
+            .background((isAdded ? Color.green : Color.red).opacity(0.14))
+        }
     }
 }
