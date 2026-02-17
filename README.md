@@ -9,8 +9,11 @@ Native macOS (SwiftUI) GUI for driving Codex from CLI on Intel Macs.
 3. Open the selected project in VS Code.
 4. Automatically run dependency setup when a project folder is selected.
 5. Auto-commit and auto-push after each chat turn (plus manual `Push` / `Commit + Push` buttons).
-6. Stream live Codex activity ("thinking", tool events, errors) while each turn runs.
-7. Show added/removed line summary with file-level stats and line previews after each run.
+6. Start and keep a persistent autonomous Codex session per project (reused across prompts via `exec resume`).
+7. Show changes in a collapsed accordion (`+/-` summary, file stats, and line previews on expand).
+8. Keep power-user logs hidden by default (toggle `Power User`).
+9. Keep git controls hidden by default (toggle `Setup Git`).
+10. Show current model + reasoning effort and let you switch both from the top bar.
 
 ## Requirements
 
@@ -46,12 +49,13 @@ cd "/Users/tedcolegrove/Desktop/Move to Dev/Dev/Codex for Intel"
 open dist/CodexIntelApp.app
 ```
 
-## Codex command
+## Codex command and session behavior
 
 The app runs Codex directly (not through a shell `codex` command) with:
-- `exec --json --full-auto --skip-git-repo-check --output-last-message <temp file>`
+- `exec --json --full-auto --skip-git-repo-check` (session bootstrap)
+- `exec resume --json --full-auto --skip-git-repo-check <session-id> "<prompt>"` (follow-up turns)
 
-It passes recent conversation context + your latest chat message. Commands run with the selected project as the working directory, and Codex is instructed to implement changes directly (not suggestion-only mode).
+It passes recent conversation context + your latest chat message. Commands run with the selected project as the working directory, and Codex is instructed to implement changes directly (not suggestion-only mode). The app keeps a persistent autonomous session active and reuses it for subsequent prompts.
 
 It auto-searches for executable names (`codex`, `codex-x86_64-apple-darwin`, `codex-aarch64-apple-darwin`) in:
 - `/Applications/Codex.app/Contents/Resources/codex`
@@ -62,6 +66,13 @@ The app also injects a fallback PATH (`/opt/homebrew/bin:/usr/local/bin:/usr/bin
 If needed, set `Codex Path (optional override)` in the app or use env var `CODEX_BINARY=/absolute/path/to/codex`.
 When selecting/running a project, the app also runs `chmod u+rwx <project_dir>` to ensure directory access.
 If git remote/branch are not configured, git actions stay disabled, but Codex still runs in the project folder.
+
+## UI behavior
+
+- `Project` top menu contains `Open Folder`, `Locate Codex`, and `Open in VS Code`.
+- `Power User` toggle reveals command log + live activity + codex path override.
+- `Setup Git` toggle reveals git remote/branch controls and push buttons.
+- The prompt composer is multi-line and larger, and Enter sends your next chat.
 
 ## Automatic setup
 

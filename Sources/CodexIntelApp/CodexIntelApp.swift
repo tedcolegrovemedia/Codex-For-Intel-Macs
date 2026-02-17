@@ -55,6 +55,28 @@ struct DiffLine: Identifiable {
     let text: String
 }
 
+struct CodexModelsCache: Decodable {
+    let models: [CodexModelDescriptor]
+}
+
+struct CodexModelDescriptor: Decodable {
+    let slug: String
+    let visibility: String?
+    let defaultReasoningLevel: String?
+    let supportedReasoningLevels: [CodexReasoningDescriptor]?
+
+    enum CodingKeys: String, CodingKey {
+        case slug
+        case visibility
+        case defaultReasoningLevel = "default_reasoning_level"
+        case supportedReasoningLevels = "supported_reasoning_levels"
+    }
+}
+
+struct CodexReasoningDescriptor: Decodable {
+    let effort: String
+}
+
 enum ViewModelError: LocalizedError {
     case projectNotSelected
     case emptyPrompt
@@ -349,9 +371,20 @@ struct ShellRunner {
 final class AppViewModel: ObservableObject {
     @Published var projectPath = ""
     @Published var codexPathOverride = ""
+    @Published var codexCliVersion = "Detecting..."
+    @Published var codexSessionState = "Not started"
+    @Published var selectedModel = "gpt-5.3-codex"
+    @Published var selectedReasoningEffort = "xhigh"
+    @Published var availableModels = ["gpt-5.3-codex"]
+    @Published var availableReasoningEfforts = ["low", "medium", "high", "xhigh"]
+
     @Published var gitRemote = ""
     @Published var gitBranch = ""
     @Published var commitMessage = "Update via CodexIntelApp"
+    @Published var showGitSetup = false
+    @Published var showPowerUserPanel = false
+    @Published var showChangesAccordion = false
+
     @Published var draftPrompt = ""
 
     @Published var messages: [ChatMessage] = [
@@ -374,9 +407,28 @@ final class AppViewModel: ObservableObject {
     private var resolvedCodexExecutable: String?
     private var didAttemptAutoInstallCodex = false
     private let missingBrewMarker = "__BREW_MISSING__"
+    private var activeSessionID: String?
+    private var sessionBootInProgress = false
+    private var modelEffortsBySlug: [String: [String]] = [:]
+    private var currentRunAssistantDeltas = ""
+    private var currentRunAssistantCompletions: [String] = []
+
+    init() {
+        applyModelDefaultsFromConfig()
+        loadModelCatalogFromCache()
+        updateReasoningOptionsForSelectedModel()
+        Task {
+            await refreshCodexVersion()
+        }
+    }
+
     var isGitConfigured: Bool {
         !gitRemote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         !gitBranch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var currentModelSummary: String {
+        "\(selectedModel) | \(reasoningDisplayName(for: selectedReasoningEffort))"
     }
 
     func chooseProjectFolder() {
@@ -389,10 +441,18 @@ final class AppViewModel: ObservableObject {
 
         if panel.runModal() == .OK, let url = panel.url {
             projectPath = url.path
+            resetSession(reason: nil)
             log("Selected project: \(projectPath)")
             Task {
                 await ensureProjectDirectoryTrustAndAccess()
                 await runDependencyInstaller(autoTriggered: true)
+                await refreshCodexVersion()
+                do {
+                    let codexExecutable = try await ensureCodexExecutableAvailable()
+                    await startPersistentAutonomousSessionIfNeeded(executablePath: codexExecutable)
+                } catch {
+                    log("Unable to start persistent session after folder select: \(error.localizedDescription)")
+                }
             }
         }
     }
@@ -408,7 +468,38 @@ final class AppViewModel: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url {
             codexPathOverride = url.path
             resolvedCodexExecutable = nil
+            resetSession(reason: "Codex path changed. Starting a fresh autonomous session.")
             log("Configured Codex path override: \(url.path)")
+        }
+    }
+
+    func modelSelectionDidChange() {
+        updateReasoningOptionsForSelectedModel()
+        resetSession(reason: "Model changed. Starting a fresh autonomous session.")
+        Task {
+            await maybeStartSessionForCurrentProject()
+        }
+    }
+
+    func reasoningSelectionDidChange() {
+        resetSession(reason: "Reasoning effort changed. Starting a fresh autonomous session.")
+        Task {
+            await maybeStartSessionForCurrentProject()
+        }
+    }
+
+    func reasoningDisplayName(for effort: String) -> String {
+        switch effort.lowercased() {
+        case "low":
+            return "Low"
+        case "medium":
+            return "Medium"
+        case "high":
+            return "High"
+        case "xhigh":
+            return "Extra High"
+        default:
+            return effort
         }
     }
 
@@ -464,25 +555,20 @@ final class AppViewModel: ObservableObject {
 
     private func runCodex(for userPrompt: String) async {
         resetRunFeedback()
-        let lastMessageURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-            .appendingPathComponent("codex-intel-last-\(UUID().uuidString).txt")
+        resetAssistantCapture()
 
         do {
             try validateProjectAndTemplate(prompt: userPrompt)
             let codexExecutable = try await ensureCodexExecutableAvailable()
             await ensureProjectDirectoryTrustAndAccess()
-            let enrichedPrompt = buildPromptWithHistory(newPrompt: userPrompt)
-            thinkingStatus = "Thinking..."
-            appendActivity("Starting Codex in autonomous mode")
+            await startPersistentAutonomousSessionIfNeeded(executablePath: codexExecutable)
 
-            let codexArguments: [String] = [
-                "exec",
-                "--json",
-                "--full-auto",
-                "--skip-git-repo-check",
-                "--output-last-message", lastMessageURL.path,
-                enrichedPrompt
-            ]
+            resetAssistantCapture()
+            let prompt = buildPromptWithHistory(newPrompt: userPrompt)
+            thinkingStatus = "Thinking..."
+            appendActivity("Running autonomous Codex turn")
+
+            let codexArguments = buildCodexTurnArguments(prompt: prompt)
             let output = try await executeBusyExecutableStreaming(
                 label: "Running Codex",
                 executablePath: codexExecutable,
@@ -500,7 +586,7 @@ final class AppViewModel: ObservableObject {
                 thinkingStatus = ""
                 return
             }
-            let response = readAssistantOutput(from: lastMessageURL, fallback: cleanOutput(output.stdout, fallback: output.stderr))
+            let response = resolvedAssistantResponse(fallback: cleanOutput(output.stdout, fallback: output.stderr))
             messages.append(ChatMessage(role: .assistant, content: response))
             appendActivity("Codex response complete")
             thinkingStatus = ""
@@ -512,7 +598,6 @@ final class AppViewModel: ObservableObject {
             appendActivity("Error: \(text)")
             thinkingStatus = ""
         }
-        try? FileManager.default.removeItem(at: lastMessageURL)
         await autoCommitAndPushAfterChat()
     }
 
@@ -657,9 +742,9 @@ final class AppViewModel: ObservableObject {
     }
 
     private func buildPromptWithHistory(newPrompt: String) -> String {
-        let recentHistory = messages.suffix(8).map { message in
+        let recentHistory = messages.suffix(6).map { message in
             let normalized = message.content.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-            let clipped = normalized.count > 700 ? String(normalized.prefix(700)) + "..." : normalized
+            let clipped = normalized.count > 500 ? String(normalized.prefix(500)) + "..." : normalized
             return "\(message.role.rawValue): \(clipped)"
         }.joined(separator: "\n")
 
@@ -668,12 +753,200 @@ final class AppViewModel: ObservableObject {
         Implement requested changes directly in files and run needed commands.
         Do not stop at suggestions when you can safely make the change in this workspace.
         Keep your final response concise and action-focused.
-        Recent conversation:
-        \(recentHistory)
+        If a command fails, debug and retry with a concrete fix.
 
         Latest user request:
         \(newPrompt)
+
+        Recent conversation:
+        \(recentHistory)
         """
+    }
+
+    private func maybeStartSessionForCurrentProject() async {
+        let path = projectPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else { return }
+        do {
+            let codexExecutable = try await ensureCodexExecutableAvailable()
+            await startPersistentAutonomousSessionIfNeeded(executablePath: codexExecutable)
+        } catch {
+            log("Unable to start session for current project: \(error.localizedDescription)")
+        }
+    }
+
+    private func startPersistentAutonomousSessionIfNeeded(executablePath: String) async {
+        if let activeSessionID, !activeSessionID.isEmpty {
+            codexSessionState = "Active (\(shortSessionID(activeSessionID)))"
+            return
+        }
+        guard !sessionBootInProgress else { return }
+        sessionBootInProgress = true
+        defer { sessionBootInProgress = false }
+
+        codexSessionState = "Starting..."
+        thinkingStatus = "Starting session..."
+        appendActivity("Starting persistent autonomous session")
+        resetAssistantCapture()
+
+        let bootstrapPrompt = """
+        Start a persistent autonomous coding session in this project directory.
+        Do not modify files in this bootstrap turn.
+        Reply exactly: SESSION_READY
+        """
+
+        do {
+            let output = try await executeBusyExecutableStreaming(
+                label: "Starting Codex Session",
+                executablePath: executablePath,
+                arguments: buildCodexExecArguments(prompt: bootstrapPrompt)
+            ) { [weak self] source, line in
+                Task { @MainActor in
+                    self?.handleCodexStreamLine(source: source, line: line)
+                }
+            }
+
+            if output.exitCode != 0 {
+                codexSessionState = "Start failed"
+                appendActivity("Session start failed (\(output.exitCode))")
+                thinkingStatus = ""
+                return
+            }
+
+            if let activeSessionID, !activeSessionID.isEmpty {
+                codexSessionState = "Active (\(shortSessionID(activeSessionID)))"
+                appendActivity("Session active.")
+            } else {
+                codexSessionState = "Ready"
+                appendActivity("Session ready.")
+            }
+        } catch {
+            codexSessionState = "Start failed"
+            appendActivity("Session start error: \(error.localizedDescription)")
+        }
+        thinkingStatus = ""
+    }
+
+    private func buildCodexTurnArguments(prompt: String) -> [String] {
+        if let activeSessionID, !activeSessionID.isEmpty {
+            return buildCodexResumeArguments(sessionID: activeSessionID, prompt: prompt)
+        }
+        return buildCodexExecArguments(prompt: prompt)
+    }
+
+    private func buildCodexExecArguments(prompt: String) -> [String] {
+        ["exec"] + codexModelArguments() + [
+            "--json",
+            "--full-auto",
+            "--skip-git-repo-check",
+            prompt
+        ]
+    }
+
+    private func buildCodexResumeArguments(sessionID: String, prompt: String) -> [String] {
+        ["exec", "resume"] + codexModelArguments() + [
+            "--json",
+            "--full-auto",
+            "--skip-git-repo-check",
+            sessionID,
+            prompt
+        ]
+    }
+
+    private func codexModelArguments() -> [String] {
+        let model = selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effort = selectedReasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines)
+        var args: [String] = []
+        if !model.isEmpty {
+            args += ["-m", model]
+        }
+        if !effort.isEmpty {
+            args += ["-c", "model_reasoning_effort=\"\(effort)\""]
+        }
+        return args
+    }
+
+    private func resetSession(reason: String?) {
+        activeSessionID = nil
+        codexSessionState = "Not started"
+        if let reason {
+            appendActivity(reason)
+        }
+    }
+
+    private func shortSessionID(_ id: String) -> String {
+        String(id.prefix(8))
+    }
+
+    private func refreshCodexVersion() async {
+        guard let output = try? await runner.run(command: "codex --version", workingDirectory: nil) else {
+            codexCliVersion = "Not found"
+            return
+        }
+        let version = cleanOutput(output.stdout, fallback: output.stderr)
+        codexCliVersion = version.replacingOccurrences(of: "\n", with: " ")
+    }
+
+    private func applyModelDefaultsFromConfig() {
+        let configPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/config.toml")
+            .path
+        guard let configText = try? String(contentsOfFile: configPath, encoding: .utf8) else { return }
+        for rawLine in configText.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let value = parseQuotedTOMLValue(line: line, key: "model") {
+                selectedModel = value
+            }
+            if let value = parseQuotedTOMLValue(line: line, key: "model_reasoning_effort") {
+                selectedReasoningEffort = value
+            }
+        }
+    }
+
+    private func loadModelCatalogFromCache() {
+        let cachePath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/models_cache.json")
+            .path
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: cachePath)) else { return }
+        guard let cache = try? JSONDecoder().decode(CodexModelsCache.self, from: data) else { return }
+
+        let visibleModels = cache.models.filter { model in
+            guard let visibility = model.visibility else { return true }
+            return visibility != "hidden"
+        }
+
+        let slugs = visibleModels.map(\.slug)
+        if !slugs.isEmpty {
+            availableModels = slugs
+        }
+
+        var effortMap: [String: [String]] = [:]
+        for model in visibleModels {
+            let efforts = model.supportedReasoningLevels?.map(\.effort).filter { !$0.isEmpty } ?? []
+            let fallback = model.defaultReasoningLevel.map { [$0] } ?? ["medium"]
+            effortMap[model.slug] = efforts.isEmpty ? fallback : efforts
+        }
+        modelEffortsBySlug = effortMap
+
+        if !availableModels.contains(selectedModel), let first = availableModels.first {
+            selectedModel = first
+        }
+        updateReasoningOptionsForSelectedModel()
+    }
+
+    private func updateReasoningOptionsForSelectedModel() {
+        let options = modelEffortsBySlug[selectedModel] ?? ["low", "medium", "high", "xhigh"]
+        availableReasoningEfforts = options
+        if !options.contains(selectedReasoningEffort), let first = options.first {
+            selectedReasoningEffort = first
+        }
+    }
+
+    private func parseQuotedTOMLValue(line: String, key: String) -> String? {
+        guard line.hasPrefix("\(key) =") else { return nil }
+        guard let firstQuote = line.firstIndex(of: "\"") else { return nil }
+        let rest = line[line.index(after: firstQuote)...]
+        guard let lastQuote = rest.firstIndex(of: "\"") else { return nil }
+        return String(rest[..<lastQuote])
     }
 
     private func resolveCodexExecutable() async throws -> String {
@@ -931,6 +1204,7 @@ final class AppViewModel: ObservableObject {
         latestDiffRemoved = 0
         latestDiffFiles.removeAll()
         latestDiffLines.removeAll()
+        showChangesAccordion = false
     }
 
     private func appendActivity(_ value: String) {
@@ -957,6 +1231,13 @@ final class AppViewModel: ObservableObject {
         }
 
         let type = (event["type"] as? String) ?? "event"
+        if type == "thread.started", let threadID = event["thread_id"] as? String, !threadID.isEmpty {
+            activeSessionID = threadID
+            codexSessionState = "Active (\(shortSessionID(threadID)))"
+        }
+
+        captureAssistantFromEvent(type: type, event: event)
+
         if type.contains("delta") {
             return
         }
@@ -982,6 +1263,24 @@ final class AppViewModel: ObservableObject {
         guard let data = line.data(using: .utf8) else { return nil }
         guard let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
         return object as? [String: Any]
+    }
+
+    private func captureAssistantFromEvent(type: String, event: [String: Any]) {
+        if type.contains("output_text.delta"), let delta = event["delta"] as? String, !delta.isEmpty {
+            currentRunAssistantDeltas += delta
+        }
+
+        if let item = event["item"] as? [String: Any] {
+            let role = (item["role"] as? String)?.lowercased()
+            let itemType = (item["type"] as? String)?.lowercased()
+            if role == "assistant" || (role == nil && itemType == "message") {
+                let textSegments = extractAssistantTextSegments(from: item)
+                let merged = textSegments.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !merged.isEmpty {
+                    currentRunAssistantCompletions.append(merged)
+                }
+            }
+        }
     }
 
     private func summarizeCodexEvent(type: String, event: [String: Any]) -> String? {
@@ -1029,6 +1328,68 @@ final class AppViewModel: ObservableObject {
         return nil
     }
 
+    private func resetAssistantCapture() {
+        currentRunAssistantDeltas = ""
+        currentRunAssistantCompletions.removeAll()
+    }
+
+    private func resolvedAssistantResponse(fallback: String) -> String {
+        if let last = currentRunAssistantCompletions.last {
+            let trimmed = last.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        let delta = currentRunAssistantDeltas.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !delta.isEmpty {
+            return delta
+        }
+        return fallback
+    }
+
+    private func extractAssistantTextSegments(from value: Any) -> [String] {
+        if let text = value as? String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? [] : [trimmed]
+        }
+
+        if let array = value as? [Any] {
+            return array.flatMap { extractAssistantTextSegments(from: $0) }
+        }
+
+        if let dictionary = value as? [String: Any] {
+            var values: [String] = []
+
+            if let text = dictionary["text"] as? String {
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    values.append(trimmed)
+                }
+            }
+            if let delta = dictionary["delta"] as? String {
+                let trimmed = delta.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    values.append(trimmed)
+                }
+            }
+            if let content = dictionary["content"] {
+                values += extractAssistantTextSegments(from: content)
+            }
+            if let output = dictionary["output"] {
+                values += extractAssistantTextSegments(from: output)
+            }
+            if let message = dictionary["message"] as? String {
+                let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    values.append(trimmed)
+                }
+            }
+            return values
+        }
+
+        return []
+    }
+
     private func flattenedStrings(from value: Any) -> [String] {
         if let text = value as? String {
             return [text.trimmingCharacters(in: .whitespacesAndNewlines)]
@@ -1040,14 +1401,6 @@ final class AppViewModel: ObservableObject {
             return dictionary.values.flatMap { flattenedStrings(from: $0) }
         }
         return []
-    }
-
-    private func readAssistantOutput(from url: URL, fallback: String) -> String {
-        guard let raw = try? String(contentsOf: url, encoding: .utf8) else {
-            return fallback
-        }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? fallback : trimmed
     }
 
     private func refreshChangeSummary() async {
@@ -1206,177 +1559,241 @@ struct ContentView: View {
     @StateObject private var viewModel = AppViewModel()
 
     var body: some View {
-        HStack(spacing: 0) {
-            controlPanel
-                .frame(width: 360)
-                .background(Color(nsColor: .windowBackgroundColor))
+        VStack(spacing: 0) {
+            topMenuBar
             Divider()
-            conversationPanel
+            HStack(spacing: 0) {
+                controlPanel
+                    .frame(width: 360)
+                    .background(Color(nsColor: .windowBackgroundColor))
+                Divider()
+                conversationPanel
+            }
+        }
+    }
+
+    private var topMenuBar: some View {
+        HStack(spacing: 10) {
+            Menu {
+                Button("Open Folder") {
+                    viewModel.chooseProjectFolder()
+                }
+                Button("Locate Codex") {
+                    viewModel.chooseCodexBinary()
+                }
+                .disabled(viewModel.isBusy)
+                Button("Open in VS Code") {
+                    viewModel.openInVSCode()
+                }
+                .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy)
+            } label: {
+                Label("Project", systemImage: "folder")
+            }
+
+            Button(viewModel.showGitSetup ? "Hide Git Setup" : "Setup Git") {
+                viewModel.showGitSetup.toggle()
+            }
+
+            Button(viewModel.showPowerUserPanel ? "Hide Power User" : "Power User") {
+                viewModel.showPowerUserPanel.toggle()
+            }
+
+            Spacer()
+
+            Text("Model")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            Picker("Model", selection: $viewModel.selectedModel) {
+                ForEach(viewModel.availableModels, id: \.self) { model in
+                    Text(model).tag(model)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 180)
+
+            Picker("Reasoning", selection: $viewModel.selectedReasoningEffort) {
+                ForEach(viewModel.availableReasoningEfforts, id: \.self) { effort in
+                    Text(viewModel.reasoningDisplayName(for: effort)).tag(effort)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 130)
+
+            Text(viewModel.codexCliVersion)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .textSelection(.enabled)
+                .frame(maxWidth: 220, alignment: .trailing)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .onChange(of: viewModel.selectedModel) { _ in
+            viewModel.modelSelectionDidChange()
+        }
+        .onChange(of: viewModel.selectedReasoningEffort) { _ in
+            viewModel.reasoningSelectionDidChange()
         }
     }
 
     private var controlPanel: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 16) {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Project")
+                    Text("Workspace")
                         .font(.headline)
                     Text(viewModel.projectPath.isEmpty ? "No folder selected" : viewModel.projectPath)
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .textSelection(.enabled)
-                    HStack {
-                        Button("Open Folder") {
-                            viewModel.chooseProjectFolder()
-                        }
-                        Button("Locate Codex") {
-                            viewModel.chooseCodexBinary()
-                        }
-                        .disabled(viewModel.isBusy)
-                        Button("Open in VS Code") {
-                            viewModel.openInVSCode()
-                        }
-                        .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy)
-                    }
-                    TextField("Codex Path (optional override)", text: $viewModel.codexPathOverride)
-                        .textFieldStyle(.roundedBorder)
-                        .disabled(viewModel.isBusy)
+                    Text("Session: \(viewModel.codexSessionState)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Text("Current: \(viewModel.currentModelSummary)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
 
                 Divider()
 
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Git")
-                        .font(.headline)
-                    TextField("Remote", text: $viewModel.gitRemote)
-                        .textFieldStyle(.roundedBorder)
-                    TextField("Branch", text: $viewModel.gitBranch)
-                        .textFieldStyle(.roundedBorder)
-                    TextField("Commit Message", text: $viewModel.commitMessage)
-                        .textFieldStyle(.roundedBorder)
-                    HStack {
-                        Button("Push") {
-                            viewModel.gitPush()
-                        }
-                        .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy || !viewModel.isGitConfigured)
-
-                        Button("Commit + Push") {
-                            viewModel.gitCommitAndPush()
-                        }
-                        .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy || !viewModel.isGitConfigured)
-                    }
-                }
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Command Log")
-                        .font(.headline)
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 6) {
-                            ForEach(Array(viewModel.commandLog.enumerated()), id: \.offset) { _, line in
-                                Text(line)
-                                    .font(.caption2)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        }
-                    }
-                    .frame(minHeight: 180, maxHeight: 240)
-                    .padding(8)
-                    .background(Color(nsColor: .controlBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Live Activity")
-                        .font(.headline)
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 6) {
-                            if viewModel.liveActivity.isEmpty {
-                                Text("Activity appears here while Codex is running.")
+                    DisclosureGroup(isExpanded: $viewModel.showChangesAccordion) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            if viewModel.latestDiffFiles.isEmpty {
+                                Text("No change summary available yet.")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             } else {
-                                ForEach(Array(viewModel.liveActivity.enumerated()), id: \.offset) { _, line in
+                                ScrollView {
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        ForEach(viewModel.latestDiffFiles) { file in
+                                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                                Text(file.path)
+                                                    .font(.caption2)
+                                                    .lineLimit(1)
+                                                Spacer(minLength: 4)
+                                                Text("+\(file.added)")
+                                                    .font(.caption2.weight(.semibold))
+                                                    .foregroundColor(.green)
+                                                Text("-\(file.removed)")
+                                                    .font(.caption2.weight(.semibold))
+                                                    .foregroundColor(.red)
+                                            }
+                                        }
+                                    }
+                                }
+                                .frame(minHeight: 90, maxHeight: 130)
+                                .padding(8)
+                                .background(Color(nsColor: .controlBackgroundColor))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                            }
+
+                            if !viewModel.latestDiffLines.isEmpty {
+                                ScrollView {
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        ForEach(viewModel.latestDiffLines) { line in
+                                            HStack(alignment: .top, spacing: 6) {
+                                                Text(line.kind == .added ? "+" : "-")
+                                                    .font(.caption.weight(.semibold))
+                                                    .foregroundColor(line.kind == .added ? .green : .red)
+                                                Text(line.text)
+                                                    .font(.system(.caption, design: .monospaced))
+                                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                            }
+                                        }
+                                    }
+                                }
+                                .frame(minHeight: 90, maxHeight: 170)
+                                .padding(8)
+                                .background(Color(nsColor: .controlBackgroundColor))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                            }
+                        }
+                    } label: {
+                        HStack {
+                            Text("Changes (Last Run)")
+                                .font(.headline)
+                            Spacer()
+                            Text("+\(viewModel.latestDiffAdded)")
+                                .font(.caption.weight(.semibold))
+                                .foregroundColor(.green)
+                            Text("-\(viewModel.latestDiffRemoved)")
+                                .font(.caption.weight(.semibold))
+                                .foregroundColor(.red)
+                        }
+                    }
+                }
+
+                if viewModel.showGitSetup {
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Git Setup")
+                            .font(.headline)
+                        TextField("Remote", text: $viewModel.gitRemote)
+                            .textFieldStyle(.roundedBorder)
+                        TextField("Branch", text: $viewModel.gitBranch)
+                            .textFieldStyle(.roundedBorder)
+                        TextField("Commit Message", text: $viewModel.commitMessage)
+                            .textFieldStyle(.roundedBorder)
+                        HStack {
+                            Button("Push") {
+                                viewModel.gitPush()
+                            }
+                            .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy || !viewModel.isGitConfigured)
+
+                            Button("Commit + Push") {
+                                viewModel.gitCommitAndPush()
+                            }
+                            .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy || !viewModel.isGitConfigured)
+                        }
+                    }
+                }
+
+                if viewModel.showPowerUserPanel {
+                    Divider()
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Power User")
+                            .font(.headline)
+                        TextField("Codex Path (optional override)", text: $viewModel.codexPathOverride)
+                            .textFieldStyle(.roundedBorder)
+                            .disabled(viewModel.isBusy)
+
+                        Text("Command Log")
+                            .font(.subheadline.weight(.semibold))
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 6) {
+                                ForEach(Array(viewModel.commandLog.enumerated()), id: \.offset) { _, line in
                                     Text(line)
                                         .font(.caption2)
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                             }
                         }
-                    }
-                    .frame(minHeight: 120, maxHeight: 180)
-                    .padding(8)
-                    .background(Color(nsColor: .controlBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
-
-                Divider()
-
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Changes (Last Run)")
-                        .font(.headline)
-                    HStack(spacing: 10) {
-                        Text("+\(viewModel.latestDiffAdded)")
-                            .font(.caption.weight(.semibold))
-                            .foregroundColor(.green)
-                        Text("-\(viewModel.latestDiffRemoved)")
-                            .font(.caption.weight(.semibold))
-                            .foregroundColor(.red)
-                    }
-
-                    if viewModel.latestDiffFiles.isEmpty {
-                        Text("No change summary available yet.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    } else {
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 6) {
-                                ForEach(viewModel.latestDiffFiles) { file in
-                                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                        Text(file.path)
-                                            .font(.caption2)
-                                            .lineLimit(1)
-                                        Spacer(minLength: 4)
-                                        Text("+\(file.added)")
-                                            .font(.caption2.weight(.semibold))
-                                            .foregroundColor(.green)
-                                        Text("-\(file.removed)")
-                                            .font(.caption2.weight(.semibold))
-                                            .foregroundColor(.red)
-                                    }
-                                }
-                            }
-                        }
-                        .frame(minHeight: 90, maxHeight: 140)
+                        .frame(minHeight: 130, maxHeight: 190)
                         .padding(8)
                         .background(Color(nsColor: .controlBackgroundColor))
                         .clipShape(RoundedRectangle(cornerRadius: 8))
-                    }
 
-                    if !viewModel.latestDiffLines.isEmpty {
+                        Text("Live Activity")
+                            .font(.subheadline.weight(.semibold))
                         ScrollView {
                             VStack(alignment: .leading, spacing: 6) {
-                                ForEach(viewModel.latestDiffLines) { line in
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(line.file)
+                                if viewModel.liveActivity.isEmpty {
+                                    Text("Activity appears here while Codex is running.")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                } else {
+                                    ForEach(Array(viewModel.liveActivity.enumerated()), id: \.offset) { _, line in
+                                        Text(line)
                                             .font(.caption2)
-                                            .foregroundColor(.secondary)
-                                        HStack(alignment: .top, spacing: 6) {
-                                            Text(line.kind == .added ? "+" : "-")
-                                                .font(.caption.weight(.semibold))
-                                                .foregroundColor(line.kind == .added ? .green : .red)
-                                            Text(line.text)
-                                                .font(.system(.caption, design: .monospaced))
-                                                .frame(maxWidth: .infinity, alignment: .leading)
-                                        }
+                                            .frame(maxWidth: .infinity, alignment: .leading)
                                     }
                                 }
                             }
                         }
-                        .frame(minHeight: 120, maxHeight: 200)
+                        .frame(minHeight: 130, maxHeight: 190)
                         .padding(8)
                         .background(Color(nsColor: .controlBackgroundColor))
                         .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -1385,6 +1802,12 @@ struct ContentView: View {
             }
             .padding(16)
         }
+    }
+
+    private var sendDisabled: Bool {
+        viewModel.projectPath.isEmpty ||
+            viewModel.isBusy ||
+            viewModel.draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var conversationPanel: some View {
@@ -1417,17 +1840,27 @@ struct ContentView: View {
             .padding(.horizontal, 16)
 
             HStack(alignment: .bottom, spacing: 10) {
-                TextField("Ask Codex to edit files, run commands, or implement features...", text: $viewModel.draftPrompt)
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(viewModel.isBusy)
-                    .onSubmit {
-                        viewModel.sendPrompt()
-                    }
-
-                Button("Send") {
+                TextField(
+                    "Ask Codex to edit files, run commands, or implement features...",
+                    text: $viewModel.draftPrompt,
+                    axis: .vertical
+                )
+                .lineLimit(5...12)
+                .textFieldStyle(.roundedBorder)
+                .disabled(viewModel.isBusy)
+                .onSubmit {
                     viewModel.sendPrompt()
                 }
-                .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy || viewModel.draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                Button {
+                    viewModel.sendPrompt()
+                } label: {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 30))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(sendDisabled ? .gray : .accentColor)
+                .disabled(sendDisabled)
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 16)
