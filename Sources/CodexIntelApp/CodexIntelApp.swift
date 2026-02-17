@@ -1810,19 +1810,22 @@ struct ContentView: View {
             viewModel.draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    private var inlineStatusText: String {
+        if viewModel.isBusy {
+            return viewModel.thinkingStatus.isEmpty ? viewModel.busyLabel : viewModel.thinkingStatus
+        }
+        if !viewModel.projectPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Session: \(viewModel.codexSessionState) | Model: \(viewModel.currentModelSummary)"
+        }
+        return "Select a project folder to start Codex."
+    }
+
     private var conversationPanel: some View {
         VStack(spacing: 12) {
             HStack {
                 Text("Conversation")
                     .font(.title3.weight(.semibold))
                 Spacer()
-                if viewModel.isBusy {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text(viewModel.thinkingStatus.isEmpty ? viewModel.busyLabel : viewModel.thinkingStatus)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
             }
             .padding(.horizontal, 16)
             .padding(.top, 14)
@@ -1837,6 +1840,23 @@ struct ContentView: View {
             }
             .background(Color(nsColor: .textBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 10))
+            .padding(.horizontal, 16)
+
+            HStack(spacing: 8) {
+                if viewModel.isBusy {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+                Text(inlineStatusText)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
             .padding(.horizontal, 16)
 
             HStack(alignment: .bottom, spacing: 10) {
