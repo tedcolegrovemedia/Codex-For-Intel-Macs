@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import SwiftUI
+import UniformTypeIdentifiers
 
 @main
 struct CodexIntelApp: App {
@@ -558,6 +559,27 @@ final class AppViewModel: ObservableObject {
                 command: "if command -v code >/dev/null 2>&1; then code .; else open -a \"Visual Studio Code\" .; fi",
                 includeAsAssistantMessage: false
             )
+        }
+    }
+
+    func exportPowerUserLog() {
+        let savePanel = NSSavePanel()
+        savePanel.title = "Export Log"
+        savePanel.canCreateDirectories = true
+        savePanel.isExtensionHidden = false
+        savePanel.allowedContentTypes = [.plainText]
+        savePanel.nameFieldStringValue = "codexintel-log-\(timestampForFilename()).txt"
+
+        guard savePanel.runModal() == .OK, let url = savePanel.url else { return }
+
+        let content = powerUserLogExportText()
+        do {
+            try content.write(to: url, atomically: true, encoding: .utf8)
+            log("Exported power user log to \(url.path)")
+            appendActivity("Exported log file.")
+        } catch {
+            log("Failed to export log: \(error.localizedDescription)")
+            messages.append(ChatMessage(role: .system, content: "Log export failed: \(error.localizedDescription)"))
         }
     }
 
@@ -1972,6 +1994,45 @@ final class AppViewModel: ObservableObject {
         if compact.count <= maxLength { return compact }
         return String(compact.prefix(maxLength)) + "..."
     }
+
+    private func powerUserLogExportText() -> String {
+        var lines: [String] = []
+        lines.append("CodexIntelApp Log Export")
+        lines.append("Generated: \(iso8601Timestamp(Date()))")
+        lines.append("Project: \(projectPath.isEmpty ? "(none)" : projectPath)")
+        lines.append("Session: \(codexSessionState)")
+        lines.append("Model: \(currentModelSummary)")
+        lines.append("")
+
+        lines.append("Command Log")
+        if commandLog.isEmpty {
+            lines.append("(empty)")
+        } else {
+            lines.append(contentsOf: commandLog)
+        }
+
+        lines.append("")
+        lines.append("Live Activity")
+        if liveActivity.isEmpty {
+            lines.append("(empty)")
+        } else {
+            lines.append(contentsOf: liveActivity)
+        }
+        lines.append("")
+
+        return lines.joined(separator: "\n")
+    }
+
+    private func timestampForFilename() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return formatter.string(from: Date())
+    }
+
+    private func iso8601Timestamp(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        return formatter.string(from: date)
+    }
 }
 
 struct ContentView: View {
@@ -2006,38 +2067,55 @@ struct ContentView: View {
                 }
                 .disabled(viewModel.projectPath.isEmpty || viewModel.isBusy)
             } label: {
-                Label("Project", systemImage: "folder")
+                topBarFlatLabel("Project", systemImage: "folder")
             }
+            .menuStyle(.borderlessButton)
 
             Button(viewModel.showGitSetup ? "Hide Git Setup" : "Setup Git") {
                 viewModel.showGitSetup.toggle()
             }
+            .buttonStyle(.plain)
+            .modifier(TopBarFlatChip())
 
             Button(viewModel.showPowerUserPanel ? "Hide Power User" : "Power User") {
                 viewModel.showPowerUserPanel.toggle()
             }
+            .buttonStyle(.plain)
+            .modifier(TopBarFlatChip())
 
             Spacer()
 
-            Text("Model")
-                .font(.caption)
-                .foregroundColor(.secondary)
+            HStack(spacing: 8) {
+                Text("Model")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
 
-            Picker("Model", selection: $viewModel.selectedModel) {
-                ForEach(viewModel.availableModels, id: \.self) { model in
-                    Text(model).tag(model)
+                Picker("Model", selection: $viewModel.selectedModel) {
+                    ForEach(viewModel.availableModels, id: \.self) { model in
+                        Text(model).tag(model)
+                    }
                 }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 180)
             }
-            .labelsHidden()
-            .frame(width: 180)
+            .modifier(TopBarFlatChip())
 
-            Picker("Reasoning", selection: $viewModel.selectedReasoningEffort) {
-                ForEach(viewModel.availableReasoningEfforts, id: \.self) { effort in
-                    Text(viewModel.reasoningDisplayName(for: effort)).tag(effort)
+            HStack(spacing: 8) {
+                Text("Reasoning")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Picker("Reasoning", selection: $viewModel.selectedReasoningEffort) {
+                    ForEach(viewModel.availableReasoningEfforts, id: \.self) { effort in
+                        Text(viewModel.reasoningDisplayName(for: effort)).tag(effort)
+                    }
                 }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 130)
             }
-            .labelsHidden()
-            .frame(width: 130)
+            .modifier(TopBarFlatChip())
 
             Text(viewModel.codexCliVersion)
                 .font(.caption2)
@@ -2179,8 +2257,17 @@ struct ContentView: View {
                             .textFieldStyle(.roundedBorder)
                             .disabled(viewModel.isBusy)
 
-                        Text("Command Log")
-                            .font(.subheadline.weight(.semibold))
+                        HStack {
+                            Text("Command Log")
+                                .font(.subheadline.weight(.semibold))
+                            Spacer()
+                            Button("Export Log") {
+                                viewModel.exportPowerUserLog()
+                            }
+                            .buttonStyle(.plain)
+                            .modifier(TopBarFlatChip())
+                            .font(.caption.weight(.semibold))
+                        }
                         ScrollView {
                             VStack(alignment: .leading, spacing: 6) {
                                 ForEach(Array(viewModel.commandLog.enumerated()), id: \.offset) { _, line in
@@ -2309,6 +2396,27 @@ struct ContentView: View {
             .padding(.horizontal, 16)
             .padding(.bottom, 16)
         }
+    }
+}
+
+private struct TopBarFlatChip: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+    }
+}
+
+@ViewBuilder
+private func topBarFlatLabel(_ text: String, systemImage: String? = nil) -> some View {
+    if let systemImage {
+        Label(text, systemImage: systemImage)
+            .modifier(TopBarFlatChip())
+    } else {
+        Text(text)
+            .modifier(TopBarFlatChip())
     }
 }
 
