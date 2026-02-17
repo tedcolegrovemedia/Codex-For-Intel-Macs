@@ -65,9 +65,9 @@ If needed, set `Codex Path (optional override)` in the app or use env var `CODEX
 - `codex` (Homebrew cask)
 - Visual Studio Code (best-effort)
 
-This runs inside the app; no manual CLI commands are required. On some systems, macOS may still prompt for permission/password during installs.
-
-When you send a chat and Codex is missing, the app also attempts an automatic one-time Codex CLI install (`brew install --cask codex`) and retries.
+This runs inside the app; no manual CLI commands are required once Homebrew is present.
+When you send a chat and Codex is missing, the app attempts an automatic one-time Codex CLI install (`brew install --cask codex`) and retries.
+If Homebrew is missing, the app opens `https://brew.sh` and asks you to install it first.
 
 ## Git behavior
 

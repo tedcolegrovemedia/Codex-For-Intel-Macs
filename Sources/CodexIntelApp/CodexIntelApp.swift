@@ -211,6 +211,7 @@ final class AppViewModel: ObservableObject {
     private let runner = ShellRunner()
     private var resolvedCodexExecutable: String?
     private var didAttemptAutoInstallCodex = false
+    private let missingBrewMarker = "__BREW_MISSING__"
     var isGitConfigured: Bool {
         !gitRemote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         !gitBranch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -337,6 +338,10 @@ final class AppViewModel: ObservableObject {
 
             do {
                 let output = try await installCodexCliOnly()
+                if indicatesMissingBrew(output) {
+                    handleMissingHomebrew()
+                    throw ViewModelError.codexNotFound
+                }
                 if output.exitCode != 0 {
                     let details = preferredFailureText(output)
                     log("Codex auto-install command failed (\(output.exitCode)): \(details)")
@@ -387,7 +392,7 @@ final class AppViewModel: ObservableObject {
     ) async throws -> CommandOutput {
         isBusy = true
         busyLabel = label
-        log("[\(label)] \(command)")
+        log("[\(label)] \(commandPreview(command))")
         defer {
             isBusy = false
             busyLabel = ""
@@ -599,6 +604,16 @@ final class AppViewModel: ObservableObject {
                 command: command,
                 workingDirectory: nil
             )
+            if indicatesMissingBrew(output) {
+                handleMissingHomebrew()
+                return
+            }
+            if output.exitCode != 0 {
+                let details = preferredFailureText(output)
+                messages.append(ChatMessage(role: .system, content: "Dependency setup failed (\(output.exitCode)).\n\(details)"))
+                log("Dependency setup failed with code \(output.exitCode): \(details)")
+                return
+            }
             resolvedCodexExecutable = nil
             let details = cleanOutput(output.stdout, fallback: output.stderr)
             messages.append(ChatMessage(role: .system, content: "Dependency setup complete.\n\(details)"))
@@ -631,16 +646,12 @@ final class AppViewModel: ObservableObject {
         set -e
         export NONINTERACTIVE=1
 
-        if ! command -v brew >/dev/null 2>&1; then
-          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-        fi
-
         BREW_BIN="$(command -v brew || true)"
         if [ -z "$BREW_BIN" ] && [ -x /opt/homebrew/bin/brew ]; then BREW_BIN=/opt/homebrew/bin/brew; fi
         if [ -z "$BREW_BIN" ] && [ -x /usr/local/bin/brew ]; then BREW_BIN=/usr/local/bin/brew; fi
         if [ -z "$BREW_BIN" ]; then
-          echo "Homebrew is required but could not be installed."
-          exit 1
+          echo "\(missingBrewMarker)"
+          exit 86
         fi
 
         eval "$("$BREW_BIN" shellenv)"
@@ -650,6 +661,24 @@ final class AppViewModel: ObservableObject {
         \(extraInstalls)
         echo "Dependency setup finished."
         """
+    }
+
+    private func indicatesMissingBrew(_ output: CommandOutput) -> Bool {
+        let combined = output.stdout + "\n" + output.stderr
+        return combined.contains(missingBrewMarker)
+    }
+
+    private func handleMissingHomebrew() {
+        log("Homebrew missing. Opening https://brew.sh")
+        if let url = URL(string: "https://brew.sh") {
+            NSWorkspace.shared.open(url)
+        }
+        messages.append(
+            ChatMessage(
+                role: .system,
+                content: "Homebrew is required to auto-install Codex CLI. I opened brew.sh. Install Homebrew, then retry Setup Dependencies or send the chat again."
+            )
+        )
     }
 
     private func log(_ message: String) {
@@ -679,6 +708,13 @@ final class AppViewModel: ObservableObject {
         if value.isEmpty { return "''" }
         let escaped = value.replacingOccurrences(of: "'", with: "'\"'\"'")
         return "'\(escaped)'"
+    }
+
+    private func commandPreview(_ command: String) -> String {
+        let compact = command.replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "  ", with: " ")
+        let maxLength = 180
+        if compact.count <= maxLength { return compact }
+        return String(compact.prefix(maxLength)) + "..."
     }
 }
 
