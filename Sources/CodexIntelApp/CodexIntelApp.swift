@@ -932,7 +932,8 @@ final class AppViewModel: ObservableObject {
                 resetSession(reason: "Recovered from stale session state.")
                 resetAssistantCapture()
                 detectedStaleSessionErrorInCurrentRun = false
-                thinkingStatus = "Retrying..."
+                thinkingStatus = "Restarted session. Re-running your request..."
+                appendActivity("Restarted session. Re-running your request.")
 
                 output = try await executeBusyExecutableStreaming(
                     label: "Running Codex (retry)",
@@ -2498,6 +2499,11 @@ final class AppViewModel: ObservableObject {
     private func updateThinkingProgress(from rawValue: String) {
         guard isBusy else { return }
         guard let status = summarizedProgressLine(from: rawValue) else { return }
+        let previousBase = statusWithoutElapsedSuffix(thinkingStatus).lowercased()
+        let nextBase = statusWithoutElapsedSuffix(status).lowercased()
+        if previousBase != nextBase {
+            thinkingHighlights.removeAll()
+        }
         thinkingStatus = status
         lastProgressAt = Date()
 
@@ -2517,13 +2523,19 @@ final class AppViewModel: ObservableObject {
         if lowered == "thinking..." || lowered == "running autonomous codex turn" {
             return "Reviewing your request and planning edits..."
         }
+        if lowered == "reviewing request and planning edits." {
+            return "Reviewing your request and planning edits..."
+        }
+        if lowered == "restarted session. re-running your request." {
+            return "Restarted session. Re-running your request..."
+        }
         if lowered == "applying edits..." || lowered == "applying file changes." {
             return "Applying edits to files..."
         }
         if lowered == "codex response complete" {
             return "Preparing your summary..."
         }
-        if lowered.contains("stale codex session") {
+        if lowered.contains("stale codex session") || lowered.contains("session state stale") {
             return "Refreshing stale session and retrying..."
         }
         if lowered.hasPrefix("running validation:") {
@@ -2558,6 +2570,13 @@ final class AppViewModel: ObservableObject {
 
         if trimmed.hasPrefix("Changed lines:") {
             return "Collecting change summary..."
+        }
+
+        if trimmed.hasPrefix("Turn event: turn.started") {
+            return "Reviewing your request and planning edits..."
+        }
+        if trimmed.hasPrefix("Turn event: turn.completed") {
+            return "Applying edits to files..."
         }
 
         if trimmed.hasPrefix("Session ") {
