@@ -1308,7 +1308,7 @@ final class AppViewModel: ObservableObject {
           echo "__CODEX_NOT_FOUND__"
           exit 0
         fi
-        codex login status 2>/dev/null || codex auth login status 2>/dev/null || codex whoami 2>/dev/null || true
+        codex login status || codex auth login status || true
         """
 
         guard let output = try? await runner.run(command: command, workingDirectory: nil) else {
@@ -1323,6 +1323,9 @@ final class AppViewModel: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if combined.contains("__CODEX_NOT_FOUND__") {
             return "CLI not found"
+        }
+        if combined.isEmpty {
+            return "Not connected"
         }
 
         let rawLines = combined
@@ -1344,11 +1347,29 @@ final class AppViewModel: ObservableObject {
         }
 
         if let connectedLine = searchable.first(where: { isConnectedAccountStatusLine($0) }) {
+            if let email = firstEmailAddress(in: connectedLine) {
+                return truncateStatusLine("Logged in as \(email)")
+            }
             return truncateStatusLine(connectedLine)
         }
 
-        if let first = searchable.first {
+        if let email = firstEmailAddress(in: searchable.joined(separator: "\n")) {
+            return truncateStatusLine("Logged in as \(email)")
+        }
+
+        if lowered.contains("logged in") || lowered.contains("authenticated") || lowered.contains("chatgpt") {
+            if let best = searchable.first {
+                return truncateStatusLine(best)
+            }
+            return "Logged in"
+        }
+
+        if let first = searchable.first(where: { !$0.lowercased().hasPrefix("error:") }) {
             return truncateStatusLine(first)
+        }
+
+        if let fallback = searchable.first {
+            return truncateStatusLine(fallback)
         }
         return "Unknown"
     }
@@ -1719,7 +1740,13 @@ final class AppViewModel: ObservableObject {
         if lowered == "checking..." || lowered == "unavailable" || lowered == "unknown" || lowered.contains("connecting") {
             return false
         }
-        if lowered.contains("logged in") || lowered.contains("connected") || lowered.contains("api key") {
+        if lowered.contains("logged in")
+            || lowered.contains("connected")
+            || lowered.contains("api key")
+            || lowered.contains("chatgpt")
+            || lowered.contains("authenticated")
+            || firstEmailAddress(in: status) != nil
+        {
             return true
         }
         return false
@@ -1780,7 +1807,21 @@ final class AppViewModel: ObservableObject {
 
     private func isConnectedAccountStatusLine(_ line: String) -> Bool {
         let lowered = line.lowercased()
-        return lowered.contains("logged in") || lowered.contains("connected") || lowered.contains("api key")
+        return lowered.contains("logged in")
+            || lowered.contains("connected")
+            || lowered.contains("api key")
+            || lowered.contains("chatgpt")
+            || lowered.contains("authenticated")
+            || firstEmailAddress(in: line) != nil
+    }
+
+    private func firstEmailAddress(in text: String) -> String? {
+        let pattern = #"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range) else { return nil }
+        guard let matchRange = Range(match.range, in: text) else { return nil }
+        return String(text[matchRange])
     }
 
     private func truncateStatusLine(_ line: String, maxLength: Int = 80) -> String {
