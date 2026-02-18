@@ -518,6 +518,7 @@ final class AppViewModel: ObservableObject {
     private var preRunTextSnapshots: [String: String] = [:]
     private var loginFlowOpenedBrowser = false
     private var loginFlowSawDeviceCodePrompt = false
+    private var loginFlowAwaitingCodeLine = false
     private var loginFlowNeedsDeviceAuthEnablement = false
     private var loginFlowOpenedSecuritySettings = false
     private var runHeartbeatTask: Task<Void, Never>?
@@ -1334,6 +1335,7 @@ final class AppViewModel: ObservableObject {
             codexAccountStatus = "Connecting..."
             loginFlowOpenedBrowser = false
             loginFlowSawDeviceCodePrompt = false
+            loginFlowAwaitingCodeLine = false
             loginFlowNeedsDeviceAuthEnablement = false
             loginFlowOpenedSecuritySettings = false
             loginDeviceCode = nil
@@ -1348,6 +1350,13 @@ final class AppViewModel: ObservableObject {
             ) { [weak self] source, line in
                 Task { @MainActor in
                     self?.handleLoginStreamLine(source: source, line: line)
+                }
+            }
+
+            if loginDeviceCode == nil {
+                loginDeviceCode = extractDeviceCodeFromTranscript(output.stdout + "\n" + output.stderr)
+                if loginDeviceCode != nil {
+                    appendActivity("Device code is ready to copy.")
                 }
             }
 
@@ -1385,6 +1394,15 @@ final class AppViewModel: ObservableObject {
         let trimmed = stripANSIEscapeCodes(from: line).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
+        if loginFlowAwaitingCodeLine, let code = extractStandaloneDeviceCode(from: trimmed) {
+            loginDeviceCode = code
+            loginFlowAwaitingCodeLine = false
+            loginFlowSawDeviceCodePrompt = true
+            openCanonicalDeviceAuthURLIfNeeded()
+            appendActivity("Device code is ready to copy.")
+            return
+        }
+
         if let verificationURL = firstURL(in: trimmed) {
             loginVerificationURL = verificationURL.absoluteString
             if !loginFlowOpenedBrowser {
@@ -1395,13 +1413,16 @@ final class AppViewModel: ObservableObject {
 
         if let code = extractDeviceCode(from: trimmed) {
             loginDeviceCode = code
+            loginFlowAwaitingCodeLine = false
             loginFlowSawDeviceCodePrompt = true
+            openCanonicalDeviceAuthURLIfNeeded()
             appendActivity("Device code is ready to copy.")
         }
 
         if indicatesDeviceAuthEnablementRequired(trimmed) {
             loginFlowNeedsDeviceAuthEnablement = true
             loginDeviceCode = nil
+            loginFlowAwaitingCodeLine = false
             codexAccountStatus = "Enable device auth in ChatGPT Security Settings"
             openSecuritySettingsForDeviceAuthIfNeeded(sourceLine: trimmed)
             appendActivity("Device code authorization is disabled in ChatGPT Security Settings.")
@@ -1411,6 +1432,7 @@ final class AppViewModel: ObservableObject {
         let lowered = trimmed.lowercased()
         if lowered.contains("never share this code") || lowered.contains("device code") || lowered.contains("enter code") {
             loginFlowSawDeviceCodePrompt = true
+            loginFlowAwaitingCodeLine = true
             openCanonicalDeviceAuthURLIfNeeded()
             appendActivity("Waiting for code confirmation in browser...")
             return
@@ -1475,13 +1497,84 @@ final class AppViewModel: ObservableObject {
     }
 
     private func extractDeviceCode(from text: String) -> String? {
-        let pattern = #"(?i:(?:device(?:\s+code)?|user(?:\s+code)?|code)\s*[:\-]?\s*)([A-Z0-9]{3,}(?:-[A-Z0-9]{3,})+)"#
+        let cleaned = stripANSIEscapeCodes(from: text)
+        let labeledPattern = #"(?i)(?:device(?:\s+code)?|user(?:\s+code)?|verification(?:\s+code)?|one[-\s]?time\s+code|enter\s+(?:this\s+)?code)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\s]{3,31})"#
+        if let candidate = firstRegexCapture(in: cleaned, pattern: labeledPattern) {
+            if let code = normalizedDeviceCode(from: candidate) {
+                return code
+            }
+        }
+        return extractStandaloneDeviceCode(from: cleaned)
+    }
+
+    private func extractStandaloneDeviceCode(from text: String) -> String? {
+        let cleaned = stripANSIEscapeCodes(from: text)
+        let pattern = #"(?<![A-Z0-9])([A-Z0-9]{3,5}(?:-[A-Z0-9]{3,5}){1,3}|[A-Z0-9]{6,12})(?![A-Z0-9])"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+        let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+        let matches = regex.matches(in: cleaned, options: [], range: range)
+        for match in matches {
+            guard let codeRange = Range(match.range(at: 1), in: cleaned) else { continue }
+            let candidate = String(cleaned[codeRange])
+            if let normalized = normalizedDeviceCode(from: candidate) {
+                return normalized
+            }
+        }
+        return nil
+    }
+
+    private func extractDeviceCodeFromTranscript(_ transcript: String) -> String? {
+        let cleaned = stripANSIEscapeCodes(from: transcript)
+        if let direct = extractDeviceCode(from: cleaned) {
+            return direct
+        }
+
+        var awaitingCodeLine = false
+        for rawLine in cleaned.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+            let lowered = line.lowercased()
+            if lowered.contains("device code") || lowered.contains("enter code") || lowered.contains("never share this code") {
+                awaitingCodeLine = true
+                continue
+            }
+            if awaitingCodeLine, let code = extractStandaloneDeviceCode(from: line) {
+                return code
+            }
+            awaitingCodeLine = false
+        }
+        return nil
+    }
+
+    private func normalizedDeviceCode(from candidate: String) -> String? {
+        var value = candidate.uppercased()
+        value = value.replacingOccurrences(of: #"\s+"#, with: "-", options: .regularExpression)
+        value = value.replacingOccurrences(of: #"[^A-Z0-9\-]"#, with: "", options: .regularExpression)
+        value = value.replacingOccurrences(of: #"-{2,}"#, with: "-", options: .regularExpression)
+        value = value.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        guard !value.isEmpty else { return nil }
+
+        let letters = value.filter(\.isLetter).count
+        let digits = value.filter(\.isNumber).count
+        guard letters > 0, digits > 0 else { return nil }
+
+        let groupedPattern = #"^[A-Z0-9]{3,5}(?:-[A-Z0-9]{3,5}){1,3}$"#
+        let plainPattern = #"^[A-Z0-9]{6,12}$"#
+        if value.range(of: groupedPattern, options: .regularExpression) != nil {
+            return value
+        }
+        if value.range(of: plainPattern, options: .regularExpression) != nil {
+            return value
+        }
+        return nil
+    }
+
+    private func firstRegexCapture(in text: String, pattern: String) -> String? {
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         guard let match = regex.firstMatch(in: text, options: [], range: range) else { return nil }
-        guard let codeRange = Range(match.range(at: 1), in: text) else { return nil }
-        let code = String(text[codeRange]).uppercased()
-        return code.isEmpty ? nil : code
+        guard let captureRange = Range(match.range(at: 1), in: text) else { return nil }
+        return String(text[captureRange])
     }
 
     private func openCanonicalDeviceAuthURLIfNeeded() {
