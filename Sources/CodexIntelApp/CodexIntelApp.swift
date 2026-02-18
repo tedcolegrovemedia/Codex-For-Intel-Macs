@@ -480,6 +480,7 @@ final class AppViewModel: ObservableObject {
     @Published var commitMessage = "Update via CodexIntelApp"
     @Published var showGitSetup = false
     @Published var showPowerUserPanel = false
+    @Published var showDebugTerminal = false
     @Published var showChangesAccordion = false
 
     @Published var draftPrompt = ""
@@ -495,6 +496,7 @@ final class AppViewModel: ObservableObject {
         }
     }
     @Published var commandLog: [String] = []
+    @Published var terminalDebugLog: [String] = []
     @Published var isBusy = false
     @Published var busyLabel = ""
     @Published var thinkingStatus = ""
@@ -532,6 +534,7 @@ final class AppViewModel: ObservableObject {
     private let recentProjectsDefaultsKey = "CodexIntelAppRecentProjects"
     private let maxRecentProjectsCount = 12
     private let maxPersistedConversationMessages = 400
+    private let maxTerminalDebugLines = 600
     private let codexSecuritySettingsURL = "https://chatgpt.com/#settings/Security"
     private let defaultCodexDeviceAuthURL = "https://auth.openai.com/codex/device"
     private var suppressConversationPersistence = false
@@ -845,6 +848,10 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    func clearDebugTerminal() {
+        terminalDebugLog.removeAll()
+    }
+
     func exportPowerUserLog() {
         let savePanel = NSSavePanel()
         savePanel.title = "Export Log"
@@ -1118,7 +1125,12 @@ final class AppViewModel: ObservableObject {
             arguments: arguments,
             workingDirectory: directory,
             environment: environment,
-            onLine: onLine
+            onLine: { [weak self] source, line in
+                Task { @MainActor in
+                    self?.appendTerminalDebugLine(source: source, line: line, label: label)
+                }
+                onLine(source, line)
+            }
         )
     }
 
@@ -1338,6 +1350,8 @@ final class AppViewModel: ObservableObject {
         do {
             let codexExecutable = try await ensureCodexExecutableAvailable()
             codexAccountStatus = "Connecting..."
+            showDebugTerminal = true
+            clearDebugTerminal()
             loginFlowOpenedBrowser = false
             loginFlowSawDeviceCodePrompt = false
             loginFlowAwaitingCodeLine = false
@@ -3528,6 +3542,19 @@ final class AppViewModel: ObservableObject {
         return (oldStart: oldStart, newStart: newStart)
     }
 
+    private func appendTerminalDebugLine(source: StreamSource, line: String, label: String) {
+        let cleaned = stripANSIEscapeCodes(from: line).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        let channel = source == .stdout ? "stdout" : "stderr"
+        let entry = "[\(formatter.string(from: Date()))] [\(label)] [\(channel)] \(cleaned)"
+        terminalDebugLog.append(entry)
+        if terminalDebugLog.count > maxTerminalDebugLines {
+            terminalDebugLog.removeFirst(terminalDebugLog.count - maxTerminalDebugLines)
+        }
+    }
+
     private func log(_ message: String) {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
@@ -3586,6 +3613,14 @@ final class AppViewModel: ObservableObject {
             lines.append("(empty)")
         } else {
             lines.append(contentsOf: liveActivity)
+        }
+        lines.append("")
+
+        lines.append("Terminal Debug")
+        if terminalDebugLog.isEmpty {
+            lines.append("(empty)")
+        } else {
+            lines.append(contentsOf: terminalDebugLog)
         }
         lines.append("")
 
@@ -3660,6 +3695,12 @@ struct ContentView: View {
 
             Button(viewModel.showPowerUserPanel ? "Hide Power User" : "Power User") {
                 viewModel.showPowerUserPanel.toggle()
+            }
+            .buttonStyle(.plain)
+            .modifier(TopBarFlatChip())
+
+            Button(viewModel.showDebugTerminal ? "Hide Terminal" : "Show Terminal") {
+                viewModel.showDebugTerminal.toggle()
             }
             .buttonStyle(.plain)
             .modifier(TopBarFlatChip())
@@ -4188,6 +4229,61 @@ struct ContentView: View {
                             .buttonStyle(.plain)
                             .font(.caption.weight(.semibold))
                             .foregroundColor(.secondary)
+                        }
+                        .padding(10)
+                        .background(Color(nsColor: .textBackgroundColor).opacity(0.92))
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+
+                    if viewModel.showDebugTerminal {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Terminal (Debug)")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Button("Clear") {
+                                    viewModel.clearDebugTerminal()
+                                }
+                                .buttonStyle(.plain)
+                                .font(.caption.weight(.semibold))
+                                .foregroundColor(.secondary)
+                            }
+
+                            ScrollViewReader { terminalProxy in
+                                ScrollView {
+                                    LazyVStack(alignment: .leading, spacing: 4) {
+                                        if viewModel.terminalDebugLog.isEmpty {
+                                            Text("No terminal output yet.")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                        } else {
+                                            ForEach(Array(viewModel.terminalDebugLog.enumerated()), id: \.offset) { _, line in
+                                                Text(line)
+                                                    .font(.system(size: 11, weight: .regular, design: .monospaced))
+                                                    .textSelection(.enabled)
+                                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                            }
+                                        }
+
+                                        Color.clear
+                                            .frame(height: 1)
+                                            .id("terminal-debug-bottom-anchor")
+                                    }
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 6)
+                                }
+                                .onAppear {
+                                    terminalProxy.scrollTo("terminal-debug-bottom-anchor", anchor: .bottom)
+                                }
+                                .onChange(of: viewModel.terminalDebugLog.count) { _ in
+                                    terminalProxy.scrollTo("terminal-debug-bottom-anchor", anchor: .bottom)
+                                }
+                            }
+                            .frame(minHeight: 120, maxHeight: 220)
+                            .background(Color(nsColor: .windowBackgroundColor))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
                         }
                         .padding(10)
                         .background(Color(nsColor: .textBackgroundColor).opacity(0.92))
