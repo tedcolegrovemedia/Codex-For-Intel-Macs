@@ -341,11 +341,14 @@ struct ShellRunner {
 
         func appendChunk(_ text: String, source: StreamSource) {
             guard !text.isEmpty else { return }
+            let normalized = text
+                .replacingOccurrences(of: "\r\n", with: "\n")
+                .replacingOccurrences(of: "\r", with: "\n")
             lock.lock()
             switch source {
             case .stdout:
                 stdoutText += text
-                stdoutBuffer += text
+                stdoutBuffer += normalized
                 let parts = stdoutBuffer.components(separatedBy: "\n")
                 for line in parts.dropLast() {
                     let trimmed = line.trimmingCharacters(in: .newlines)
@@ -356,7 +359,7 @@ struct ShellRunner {
                 stdoutBuffer = parts.last ?? ""
             case .stderr:
                 stderrText += text
-                stderrBuffer += text
+                stderrBuffer += normalized
                 let parts = stderrBuffer.components(separatedBy: "\n")
                 for line in parts.dropLast() {
                     let trimmed = line.trimmingCharacters(in: .newlines)
@@ -464,6 +467,7 @@ final class AppViewModel: ObservableObject {
     @Published var codexAccountStatus = "Checking..."
     @Published var codexSessionState = "Not started"
     @Published var loginDeviceCode: String?
+    @Published var loginAwaitingDeviceCode = false
     @Published var loginVerificationURL = "https://auth.openai.com/codex/device"
     @Published var recentProjects: [String] = []
     @Published var selectedModel = "gpt-5.3-codex"
@@ -1340,6 +1344,7 @@ final class AppViewModel: ObservableObject {
             loginFlowNeedsDeviceAuthEnablement = false
             loginFlowOpenedSecuritySettings = false
             loginDeviceCode = nil
+            loginAwaitingDeviceCode = false
             loginVerificationURL = defaultCodexDeviceAuthURL
             appendActivity("Starting browser login flow.")
 
@@ -1354,16 +1359,16 @@ final class AppViewModel: ObservableObject {
                 }
             }
 
-            if loginDeviceCode == nil {
-                loginDeviceCode = extractDeviceCodeFromTranscript(output.stdout + "\n" + output.stderr)
-                if loginDeviceCode != nil {
-                    appendActivity("Device code is ready to copy.")
-                }
+            if loginDeviceCode == nil,
+               let fallbackCode = extractDeviceCodeFromTranscript(output.stdout + "\n" + output.stderr)
+            {
+                setLoginDeviceCode(fallbackCode)
             }
 
             if loginFlowNeedsDeviceAuthEnablement || indicatesDeviceAuthEnablementRequired(output.stdout + "\n" + output.stderr) {
                 loginFlowNeedsDeviceAuthEnablement = true
                 loginDeviceCode = nil
+                loginAwaitingDeviceCode = false
                 openSecuritySettingsForDeviceAuthIfNeeded(sourceLine: output.stdout + "\n" + output.stderr)
                 codexAccountStatus = "Enable device auth in ChatGPT Security Settings"
                 messages.append(
@@ -1381,11 +1386,14 @@ final class AppViewModel: ObservableObject {
                 appendActivity("ChatGPT account connected.")
                 messages.append(ChatMessage(role: .system, content: "ChatGPT account connected."))
                 loginDeviceCode = nil
+                loginAwaitingDeviceCode = false
             } else {
+                loginAwaitingDeviceCode = false
                 let details = sanitizedLoginFailureDetails(preferredFailureText(output) + "\n" + codexAccountStatus)
                 messages.append(ChatMessage(role: .system, content: "Login ended before connection was confirmed. \(details)"))
             }
         } catch {
+            loginAwaitingDeviceCode = false
             await refreshCodexAccountStatus()
             messages.append(ChatMessage(role: .system, content: "Unable to start browser login flow: \(error.localizedDescription)"))
         }
@@ -1395,23 +1403,13 @@ final class AppViewModel: ObservableObject {
         let trimmed = stripANSIEscapeCodes(from: line).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        if loginFlowAwaitingCodeLine, let code = extractStandaloneDeviceCode(from: trimmed) {
-            if loginDeviceCode == nil {
-                loginDeviceCode = code
-            }
-            loginFlowAwaitingCodeLine = false
-            loginFlowSawDeviceCodePrompt = true
-            openCanonicalDeviceAuthURLIfNeeded()
-            appendActivity("Device code is ready to copy.")
+        if loginFlowAwaitingCodeLine, let code = extractStandaloneDeviceCode(from: trimmed, allowPlainCode: true) {
+            setLoginDeviceCode(code)
             return
         }
 
         if loginDeviceCode == nil, let contextualCode = extractContextualDeviceCode(from: trimmed) {
-            loginDeviceCode = contextualCode
-            loginFlowAwaitingCodeLine = false
-            loginFlowSawDeviceCodePrompt = true
-            openCanonicalDeviceAuthURLIfNeeded()
-            appendActivity("Device code is ready to copy.")
+            setLoginDeviceCode(contextualCode)
         }
 
         if let verificationURL = firstURL(in: trimmed) {
@@ -1423,18 +1421,13 @@ final class AppViewModel: ObservableObject {
         }
 
         if let code = extractDeviceCode(from: trimmed) {
-            if loginDeviceCode == nil {
-                loginDeviceCode = code
-            }
-            loginFlowAwaitingCodeLine = false
-            loginFlowSawDeviceCodePrompt = true
-            openCanonicalDeviceAuthURLIfNeeded()
-            appendActivity("Device code is ready to copy.")
+            setLoginDeviceCode(code)
         }
 
         if indicatesDeviceAuthEnablementRequired(trimmed) {
             loginFlowNeedsDeviceAuthEnablement = true
             loginDeviceCode = nil
+            loginAwaitingDeviceCode = false
             loginFlowAwaitingCodeLine = false
             codexAccountStatus = "Enable device auth in ChatGPT Security Settings"
             openSecuritySettingsForDeviceAuthIfNeeded(sourceLine: trimmed)
@@ -1444,14 +1437,7 @@ final class AppViewModel: ObservableObject {
 
         let lowered = trimmed.lowercased()
         if containsDeviceCodeCue(lowered) {
-            loginFlowSawDeviceCodePrompt = true
-            loginFlowAwaitingCodeLine = loginDeviceCode == nil
-            openCanonicalDeviceAuthURLIfNeeded()
-            if loginDeviceCode == nil {
-                appendActivity("Waiting for code confirmation in browser...")
-            } else {
-                appendActivity("Paste the device code in browser to continue.")
-            }
+            beginAwaitingLoginDeviceCodeIfNeeded()
             return
         }
         if lowered.contains("waiting") || lowered.contains("authorize") || lowered.contains("browser") {
@@ -1462,6 +1448,37 @@ final class AppViewModel: ObservableObject {
 
         if source == .stderr, (lowered.contains("error") || lowered.contains("failed")) {
             appendActivity(trimmed)
+        }
+    }
+
+    private func setLoginDeviceCode(_ code: String) {
+        let normalized = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return }
+        let didChange = loginDeviceCode != normalized
+        loginDeviceCode = normalized
+        loginAwaitingDeviceCode = false
+        loginFlowAwaitingCodeLine = false
+        loginFlowSawDeviceCodePrompt = true
+        openCanonicalDeviceAuthURLIfNeeded()
+        if didChange {
+            appendActivity("Device code is ready to copy.")
+        }
+    }
+
+    private func beginAwaitingLoginDeviceCodeIfNeeded() {
+        loginFlowSawDeviceCodePrompt = true
+        guard loginDeviceCode == nil else {
+            loginAwaitingDeviceCode = false
+            appendActivity("Paste the device code in browser to continue.")
+            return
+        }
+
+        loginFlowAwaitingCodeLine = true
+        let wasAwaiting = loginAwaitingDeviceCode
+        loginAwaitingDeviceCode = true
+        openCanonicalDeviceAuthURLIfNeeded()
+        if !wasAwaiting {
+            appendActivity("Waiting for terminal to provide device code...")
         }
     }
 
@@ -1515,26 +1532,33 @@ final class AppViewModel: ObservableObject {
 
     private func extractDeviceCode(from text: String) -> String? {
         let cleaned = stripANSIEscapeCodes(from: text)
-        let labeledPattern = #"(?i)(?:device(?:\s+code)?|user(?:\s+code)?|verification(?:\s+code)?|one[-\s]?time\s+code|enter\s+(?:this\s+)?code)\s*[:\-]?\s*([A-Z0-9]{4}-[A-Z0-9]{4})"#
+        let labeledPattern = #"(?i)(?:device(?:\s+code)?|user(?:\s+code)?|verification(?:\s+code)?|one[-\s]?time\s+code|enter\s+(?:this\s+)?code)\s*[:\-]?\s*([A-Z0-9]{4}-[A-Z0-9]{4}|[A-Z0-9]{8})"#
         if let candidate = firstRegexCapture(in: cleaned, pattern: labeledPattern) {
-            if let code = normalizedDeviceCode(from: candidate) {
+            if let code = normalizedDeviceCode(from: candidate, allowPlainCode: true) {
                 return code
             }
         }
         return nil
     }
 
-    private func extractStandaloneDeviceCode(from text: String) -> String? {
+    private func extractStandaloneDeviceCode(from text: String, allowPlainCode: Bool = false) -> String? {
         let cleaned = stripANSIEscapeCodes(from: text)
-        let pattern = #"(?<![A-Z0-9])([A-Z0-9]{4}-[A-Z0-9]{4})(?![A-Z0-9])"#
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
-        let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
-        let matches = regex.matches(in: cleaned, options: [], range: range)
-        for match in matches {
-            guard let codeRange = Range(match.range(at: 1), in: cleaned) else { continue }
-            let candidate = String(cleaned[codeRange])
-            if let normalized = normalizedDeviceCode(from: candidate) {
-                return normalized
+        let patterns = allowPlainCode
+            ? [
+                #"(?<![A-Z0-9])([A-Z0-9]{4}-[A-Z0-9]{4})(?![A-Z0-9])"#,
+                #"(?<![A-Z0-9])([A-Z0-9]{8})(?![A-Z0-9])"#
+            ]
+            : [#"(?<![A-Z0-9])([A-Z0-9]{4}-[A-Z0-9]{4})(?![A-Z0-9])"#]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { continue }
+            let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+            let matches = regex.matches(in: cleaned, options: [], range: range)
+            for match in matches {
+                guard let codeRange = Range(match.range(at: 1), in: cleaned) else { continue }
+                let candidate = String(cleaned[codeRange])
+                if let normalized = normalizedDeviceCode(from: candidate, allowPlainCode: allowPlainCode) {
+                    return normalized
+                }
             }
         }
         return nil
@@ -1547,11 +1571,13 @@ final class AppViewModel: ObservableObject {
         if let labeled = extractDeviceCode(from: cleaned) {
             return labeled
         }
-        return extractStandaloneDeviceCode(from: cleaned)
+        return extractStandaloneDeviceCode(from: cleaned, allowPlainCode: true)
     }
 
     private func extractDeviceCodeFromTranscript(_ transcript: String) -> String? {
         let cleaned = stripANSIEscapeCodes(from: transcript)
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
         var awaitingCodeLine = false
         for rawLine in cleaned.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1564,7 +1590,7 @@ final class AppViewModel: ObservableObject {
                 awaitingCodeLine = true
                 continue
             }
-            if awaitingCodeLine, let code = extractStandaloneDeviceCode(from: line) {
+            if awaitingCodeLine, let code = extractStandaloneDeviceCode(from: line, allowPlainCode: true) {
                 return code
             }
             awaitingCodeLine = false
@@ -1572,7 +1598,7 @@ final class AppViewModel: ObservableObject {
         return nil
     }
 
-    private func normalizedDeviceCode(from candidate: String) -> String? {
+    private func normalizedDeviceCode(from candidate: String, allowPlainCode: Bool = false) -> String? {
         var value = candidate.uppercased()
         value = value.replacingOccurrences(of: #"\s+"#, with: "-", options: .regularExpression)
         value = value.replacingOccurrences(of: #"[^A-Z0-9\-]"#, with: "", options: .regularExpression)
@@ -1580,21 +1606,23 @@ final class AppViewModel: ObservableObject {
         value = value.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
         guard !value.isEmpty else { return nil }
 
-        let letters = value.filter(\.isLetter).count
-        let digits = value.filter(\.isNumber).count
-        guard letters > 0, digits > 0 else { return nil }
-
         let groupedPattern = #"^[A-Z0-9]{4}-[A-Z0-9]{4}$"#
         if value.range(of: groupedPattern, options: .regularExpression) != nil {
             return value
         }
-        return nil
+        guard allowPlainCode else { return nil }
+        let plain = value.replacingOccurrences(of: "-", with: "")
+        let plainPattern = #"^[A-Z0-9]{8}$"#
+        guard plain.range(of: plainPattern, options: .regularExpression) != nil else { return nil }
+        return "\(plain.prefix(4))-\(plain.suffix(4))"
     }
 
     private func containsDeviceCodeCue(_ lowered: String) -> Bool {
         lowered.contains("never share this code")
             || lowered.contains("device code")
             || lowered.contains("enter code")
+            || lowered.contains("displayed in your terminal")
+            || lowered.contains("9-character code")
             || lowered.contains("verification code")
             || lowered.contains("one-time code")
             || lowered.contains("user code")
@@ -3986,6 +4014,9 @@ struct ContentView: View {
     }
 
     private var hasVisibleLoginDeviceCode: Bool {
+        if viewModel.loginAwaitingDeviceCode {
+            return true
+        }
         guard let code = viewModel.loginDeviceCode else { return false }
         return !code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -4117,23 +4148,38 @@ struct ContentView: View {
                                 .font(.caption.weight(.semibold))
                                 .foregroundColor(.secondary)
 
-                            HStack(spacing: 8) {
-                                Text(viewModel.loginDeviceCode ?? "")
-                                    .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                                    .textSelection(.enabled)
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 6)
-                                    .background(Color(nsColor: .windowBackgroundColor))
-                                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                                Spacer(minLength: 0)
-                                Button("Copy Code") {
-                                    viewModel.copyLoginDeviceCode()
+                            let visibleCode = viewModel.loginDeviceCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                            if visibleCode.isEmpty {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                    Text("Waiting for terminal to provide device code...")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
                                 }
-                                .buttonStyle(.plain)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
                                 .background(Color(nsColor: .windowBackgroundColor))
                                 .clipShape(RoundedRectangle(cornerRadius: 8))
+                            } else {
+                                HStack(spacing: 8) {
+                                    Text(visibleCode)
+                                        .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                                        .textSelection(.enabled)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 6)
+                                        .background(Color(nsColor: .windowBackgroundColor))
+                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                                    Spacer(minLength: 0)
+                                    Button("Copy Code") {
+                                        viewModel.copyLoginDeviceCode()
+                                    }
+                                    .buttonStyle(.plain)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(Color(nsColor: .windowBackgroundColor))
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                                }
                             }
 
                             Button("Open Verification Page") {
