@@ -1553,7 +1553,7 @@ final class AppViewModel: ObservableObject {
 
     private func extractDeviceCode(from text: String) -> String? {
         let cleaned = stripANSIEscapeCodes(from: text)
-        let labeledPattern = #"(?i)(?:device(?:\s+code)?|user(?:\s+code)?|verification(?:\s+code)?|one[-\s]?time\s+code|enter\s+(?:this\s+)?code)\s*[:\-]?\s*([A-Z0-9]{4}-[A-Z0-9]{4}|[A-Z0-9]{8})"#
+        let labeledPattern = #"(?i)(?:device(?:\s+code)?|user(?:\s+code)?|verification(?:\s+code)?|one[-\s]?time\s+code|enter\s+(?:this\s+)?code)\s*[:\-]?\s*([A-Z0-9]{4}-[A-Z0-9]{5}|[A-Z0-9]{4}-[A-Z0-9]{4}|[A-Z0-9]{9}|[A-Z0-9]{8})"#
         if let candidate = firstRegexCapture(in: cleaned, pattern: labeledPattern) {
             if let code = normalizedDeviceCode(from: candidate, allowPlainCode: true) {
                 return code
@@ -1566,10 +1566,15 @@ final class AppViewModel: ObservableObject {
         let cleaned = stripANSIEscapeCodes(from: text)
         let patterns = allowPlainCode
             ? [
+                #"(?<![A-Z0-9])([A-Z0-9]{4}-[A-Z0-9]{5})(?![A-Z0-9])"#,
                 #"(?<![A-Z0-9])([A-Z0-9]{4}-[A-Z0-9]{4})(?![A-Z0-9])"#,
+                #"(?<![A-Z0-9])([A-Z0-9]{9})(?![A-Z0-9])"#,
                 #"(?<![A-Z0-9])([A-Z0-9]{8})(?![A-Z0-9])"#
             ]
-            : [#"(?<![A-Z0-9])([A-Z0-9]{4}-[A-Z0-9]{4})(?![A-Z0-9])"#]
+            : [
+                #"(?<![A-Z0-9])([A-Z0-9]{4}-[A-Z0-9]{5})(?![A-Z0-9])"#,
+                #"(?<![A-Z0-9])([A-Z0-9]{4}-[A-Z0-9]{4})(?![A-Z0-9])"#
+            ]
         for pattern in patterns {
             guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { continue }
             let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
@@ -1627,15 +1632,27 @@ final class AppViewModel: ObservableObject {
         value = value.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
         guard !value.isEmpty else { return nil }
 
+        let groupedNinePattern = #"^[A-Z0-9]{4}-[A-Z0-9]{5}$"#
+        if value.range(of: groupedNinePattern, options: .regularExpression) != nil {
+            return value
+        }
         let groupedPattern = #"^[A-Z0-9]{4}-[A-Z0-9]{4}$"#
         if value.range(of: groupedPattern, options: .regularExpression) != nil {
             return value
         }
         guard allowPlainCode else { return nil }
         let plain = value.replacingOccurrences(of: "-", with: "")
-        let plainPattern = #"^[A-Z0-9]{8}$"#
-        guard plain.range(of: plainPattern, options: .regularExpression) != nil else { return nil }
-        return "\(plain.prefix(4))-\(plain.suffix(4))"
+        let plainNinePattern = #"^[A-Z0-9]{9}$"#
+        if plain.range(of: plainNinePattern, options: .regularExpression) != nil {
+            let head = String(plain.prefix(4))
+            let tail = String(plain.suffix(5))
+            return "\(head)-\(tail)"
+        }
+        let plainEightPattern = #"^[A-Z0-9]{8}$"#
+        guard plain.range(of: plainEightPattern, options: .regularExpression) != nil else { return nil }
+        let head = String(plain.prefix(4))
+        let tail = String(plain.suffix(4))
+        return "\(head)-\(tail)"
     }
 
     private func containsDeviceCodeCue(_ lowered: String) -> Bool {
@@ -1784,6 +1801,7 @@ final class AppViewModel: ObservableObject {
             with: "",
             options: .regularExpression
         )
+        value = value.replacingOccurrences(of: "\u{001B}", with: "")
         return value
     }
 
