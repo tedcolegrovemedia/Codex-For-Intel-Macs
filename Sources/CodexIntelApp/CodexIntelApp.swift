@@ -3668,6 +3668,8 @@ struct ContentView: View {
     @StateObject private var viewModel = AppViewModel()
     @State private var collapsedChangeFiles: Set<String> = []
     @State private var isConversationAtBottom = true
+    @State private var pendingRecentProjectRemoval: String?
+    @State private var showRecentProjectRemovalConfirmation = false
     private let conversationBottomAnchorID = "conversation-bottom-anchor"
 
     var body: some View {
@@ -3869,7 +3871,8 @@ struct ContentView: View {
                                 .disabled(viewModel.isBusy)
 
                                 Button {
-                                    viewModel.removeRecentProject(path)
+                                    pendingRecentProjectRemoval = path
+                                    showRecentProjectRemovalConfirmation = true
                                 } label: {
                                     Image(systemName: "xmark.circle.fill")
                                         .font(.system(size: 14, weight: .semibold))
@@ -4049,6 +4052,21 @@ struct ContentView: View {
                 }
             }
             .padding(16)
+        }
+        .alert(
+            "Remove Recent Project?",
+            isPresented: $showRecentProjectRemovalConfirmation,
+            presenting: pendingRecentProjectRemoval
+        ) { path in
+            Button("Remove", role: .destructive) {
+                viewModel.removeRecentProject(path)
+                pendingRecentProjectRemoval = nil
+            }
+            Button("Cancel", role: .cancel) {
+                pendingRecentProjectRemoval = nil
+            }
+        } message: { path in
+            Text("This only removes \"\(URL(fileURLWithPath: path).lastPathComponent)\" from Recent Projects. Files and folders are not deleted.")
         }
     }
 
