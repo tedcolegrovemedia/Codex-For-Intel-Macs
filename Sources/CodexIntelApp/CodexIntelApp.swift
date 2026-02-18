@@ -1395,7 +1395,7 @@ final class AppViewModel: ObservableObject {
         let trimmed = stripANSIEscapeCodes(from: line).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        if loginFlowAwaitingCodeLine, let code = extractStandaloneDeviceCode(from: trimmed, allowPlainCode: true) {
+        if loginFlowAwaitingCodeLine, let code = extractStandaloneDeviceCode(from: trimmed) {
             if loginDeviceCode == nil {
                 loginDeviceCode = code
             }
@@ -1515,7 +1515,7 @@ final class AppViewModel: ObservableObject {
 
     private func extractDeviceCode(from text: String) -> String? {
         let cleaned = stripANSIEscapeCodes(from: text)
-        let labeledPattern = #"(?i)(?:device(?:\s+code)?|user(?:\s+code)?|verification(?:\s+code)?|one[-\s]?time\s+code|enter\s+(?:this\s+)?code)\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-\s]{3,31})"#
+        let labeledPattern = #"(?i)(?:device(?:\s+code)?|user(?:\s+code)?|verification(?:\s+code)?|one[-\s]?time\s+code|enter\s+(?:this\s+)?code)\s*[:\-]?\s*([A-Z0-9]{4}-[A-Z0-9]{4})"#
         if let candidate = firstRegexCapture(in: cleaned, pattern: labeledPattern) {
             if let code = normalizedDeviceCode(from: candidate) {
                 return code
@@ -1524,18 +1524,16 @@ final class AppViewModel: ObservableObject {
         return nil
     }
 
-    private func extractStandaloneDeviceCode(from text: String, allowPlainCode: Bool = false) -> String? {
+    private func extractStandaloneDeviceCode(from text: String) -> String? {
         let cleaned = stripANSIEscapeCodes(from: text)
-        let pattern = allowPlainCode
-            ? #"(?<![A-Z0-9])([A-Z0-9]{3,5}(?:-[A-Z0-9]{3,5}){1,3}|[A-Z0-9]{6,12})(?![A-Z0-9])"#
-            : #"(?<![A-Z0-9])([A-Z0-9]{3,5}(?:-[A-Z0-9]{3,5}){1,3})(?![A-Z0-9])"#
+        let pattern = #"(?<![A-Z0-9])([A-Z0-9]{4}-[A-Z0-9]{4})(?![A-Z0-9])"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
         let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
         let matches = regex.matches(in: cleaned, options: [], range: range)
         for match in matches {
             guard let codeRange = Range(match.range(at: 1), in: cleaned) else { continue }
             let candidate = String(cleaned[codeRange])
-            if let normalized = normalizedDeviceCode(from: candidate, allowPlainCode: allowPlainCode) {
+            if let normalized = normalizedDeviceCode(from: candidate) {
                 return normalized
             }
         }
@@ -1549,7 +1547,7 @@ final class AppViewModel: ObservableObject {
         if let labeled = extractDeviceCode(from: cleaned) {
             return labeled
         }
-        return extractStandaloneDeviceCode(from: cleaned, allowPlainCode: true)
+        return extractStandaloneDeviceCode(from: cleaned)
     }
 
     private func extractDeviceCodeFromTranscript(_ transcript: String) -> String? {
@@ -1566,7 +1564,7 @@ final class AppViewModel: ObservableObject {
                 awaitingCodeLine = true
                 continue
             }
-            if awaitingCodeLine, let code = extractStandaloneDeviceCode(from: line, allowPlainCode: true) {
+            if awaitingCodeLine, let code = extractStandaloneDeviceCode(from: line) {
                 return code
             }
             awaitingCodeLine = false
@@ -1574,7 +1572,7 @@ final class AppViewModel: ObservableObject {
         return nil
     }
 
-    private func normalizedDeviceCode(from candidate: String, allowPlainCode: Bool = false) -> String? {
+    private func normalizedDeviceCode(from candidate: String) -> String? {
         var value = candidate.uppercased()
         value = value.replacingOccurrences(of: #"\s+"#, with: "-", options: .regularExpression)
         value = value.replacingOccurrences(of: #"[^A-Z0-9\-]"#, with: "", options: .regularExpression)
@@ -1586,12 +1584,8 @@ final class AppViewModel: ObservableObject {
         let digits = value.filter(\.isNumber).count
         guard letters > 0, digits > 0 else { return nil }
 
-        let groupedPattern = #"^[A-Z0-9]{3,5}(?:-[A-Z0-9]{3,5}){1,3}$"#
-        let plainPattern = #"^[A-Z0-9]{6,12}$"#
+        let groupedPattern = #"^[A-Z0-9]{4}-[A-Z0-9]{4}$"#
         if value.range(of: groupedPattern, options: .regularExpression) != nil {
-            return value
-        }
-        if allowPlainCode, value.range(of: plainPattern, options: .regularExpression) != nil {
             return value
         }
         return nil
