@@ -587,6 +587,13 @@ final class AppViewModel: ObservableObject {
         messages.append(ChatMessage(role: .system, content: "Recent project path is no longer available: \(value)"))
     }
 
+    func removeRecentProject(_ path: String) {
+        let value = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        recentProjects.removeAll { $0 == value }
+        saveRecentProjects()
+    }
+
     private func activateProject(_ path: String, installDependencies: Bool) {
         projectPath = path
         addRecentProject(path)
@@ -3820,27 +3827,41 @@ struct ContentView: View {
                         Text("Recent Projects")
                             .font(.subheadline.weight(.semibold))
                         ForEach(viewModel.recentProjects, id: \.self) { path in
-                            Button {
-                                viewModel.selectRecentProject(path)
-                            } label: {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(URL(fileURLWithPath: path).lastPathComponent)
-                                        .font(.caption.weight(.semibold))
-                                        .lineLimit(1)
-                                    Text(path)
-                                        .font(.caption2)
-                                        .foregroundColor(.secondary)
-                                        .lineLimit(1)
+                            HStack(spacing: 8) {
+                                Button {
+                                    viewModel.selectRecentProject(path)
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(URL(fileURLWithPath: path).lastPathComponent)
+                                            .font(.caption.weight(.semibold))
+                                            .lineLimit(1)
+                                        Text(path)
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(8)
+                                    .background(
+                                        (path == viewModel.projectPath ? Color.accentColor.opacity(0.14) : Color(nsColor: .controlBackgroundColor))
+                                    )
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
                                 }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(8)
-                                .background(
-                                    (path == viewModel.projectPath ? Color.accentColor.opacity(0.14) : Color(nsColor: .controlBackgroundColor))
-                                )
-                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                                .buttonStyle(.plain)
+                                .disabled(viewModel.isBusy)
+
+                                Button {
+                                    viewModel.removeRecentProject(path)
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.system(size: 14, weight: .semibold))
+                                        .foregroundColor(.secondary.opacity(0.8))
+                                        .frame(width: 24, height: 24)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Remove from recent projects")
+                                .disabled(viewModel.isBusy)
                             }
-                            .buttonStyle(.plain)
-                            .disabled(viewModel.isBusy)
                         }
                     }
                 }
