@@ -1395,7 +1395,7 @@ final class AppViewModel: ObservableObject {
         let trimmed = stripANSIEscapeCodes(from: line).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
-        if loginFlowAwaitingCodeLine, let code = extractStandaloneDeviceCode(from: trimmed) {
+        if loginFlowAwaitingCodeLine, let code = extractStandaloneDeviceCode(from: trimmed, allowPlainCode: true) {
             if loginDeviceCode == nil {
                 loginDeviceCode = code
             }
@@ -1404,6 +1404,14 @@ final class AppViewModel: ObservableObject {
             openCanonicalDeviceAuthURLIfNeeded()
             appendActivity("Device code is ready to copy.")
             return
+        }
+
+        if loginDeviceCode == nil, let contextualCode = extractContextualDeviceCode(from: trimmed) {
+            loginDeviceCode = contextualCode
+            loginFlowAwaitingCodeLine = false
+            loginFlowSawDeviceCodePrompt = true
+            openCanonicalDeviceAuthURLIfNeeded()
+            appendActivity("Device code is ready to copy.")
         }
 
         if let verificationURL = firstURL(in: trimmed) {
@@ -1435,11 +1443,15 @@ final class AppViewModel: ObservableObject {
         }
 
         let lowered = trimmed.lowercased()
-        if lowered.contains("never share this code") || lowered.contains("device code") || lowered.contains("enter code") {
+        if containsDeviceCodeCue(lowered) {
             loginFlowSawDeviceCodePrompt = true
-            loginFlowAwaitingCodeLine = true
+            loginFlowAwaitingCodeLine = loginDeviceCode == nil
             openCanonicalDeviceAuthURLIfNeeded()
-            appendActivity("Waiting for code confirmation in browser...")
+            if loginDeviceCode == nil {
+                appendActivity("Waiting for code confirmation in browser...")
+            } else {
+                appendActivity("Paste the device code in browser to continue.")
+            }
             return
         }
         if lowered.contains("waiting") || lowered.contains("authorize") || lowered.contains("browser") {
@@ -1512,20 +1524,32 @@ final class AppViewModel: ObservableObject {
         return nil
     }
 
-    private func extractStandaloneDeviceCode(from text: String) -> String? {
+    private func extractStandaloneDeviceCode(from text: String, allowPlainCode: Bool = false) -> String? {
         let cleaned = stripANSIEscapeCodes(from: text)
-        let pattern = #"(?<![A-Z0-9])([A-Z0-9]{3,5}(?:-[A-Z0-9]{3,5}){1,3}|[A-Z0-9]{6,12})(?![A-Z0-9])"#
+        let pattern = allowPlainCode
+            ? #"(?<![A-Z0-9])([A-Z0-9]{3,5}(?:-[A-Z0-9]{3,5}){1,3}|[A-Z0-9]{6,12})(?![A-Z0-9])"#
+            : #"(?<![A-Z0-9])([A-Z0-9]{3,5}(?:-[A-Z0-9]{3,5}){1,3})(?![A-Z0-9])"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
         let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
         let matches = regex.matches(in: cleaned, options: [], range: range)
         for match in matches {
             guard let codeRange = Range(match.range(at: 1), in: cleaned) else { continue }
             let candidate = String(cleaned[codeRange])
-            if let normalized = normalizedDeviceCode(from: candidate) {
+            if let normalized = normalizedDeviceCode(from: candidate, allowPlainCode: allowPlainCode) {
                 return normalized
             }
         }
         return nil
+    }
+
+    private func extractContextualDeviceCode(from text: String) -> String? {
+        let cleaned = stripANSIEscapeCodes(from: text)
+        let lowered = cleaned.lowercased()
+        guard containsDeviceCodeCue(lowered) else { return nil }
+        if let labeled = extractDeviceCode(from: cleaned) {
+            return labeled
+        }
+        return extractStandaloneDeviceCode(from: cleaned, allowPlainCode: true)
     }
 
     private func extractDeviceCodeFromTranscript(_ transcript: String) -> String? {
@@ -1535,14 +1559,14 @@ final class AppViewModel: ObservableObject {
             let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !line.isEmpty else { continue }
             let lowered = line.lowercased()
-            if let inlineCode = extractDeviceCode(from: line) {
+            if let inlineCode = extractContextualDeviceCode(from: line) {
                 return inlineCode
             }
-            if lowered.contains("device code") || lowered.contains("enter code") || lowered.contains("never share this code") {
+            if containsDeviceCodeCue(lowered) {
                 awaitingCodeLine = true
                 continue
             }
-            if awaitingCodeLine, let code = extractStandaloneDeviceCode(from: line) {
+            if awaitingCodeLine, let code = extractStandaloneDeviceCode(from: line, allowPlainCode: true) {
                 return code
             }
             awaitingCodeLine = false
@@ -1550,7 +1574,7 @@ final class AppViewModel: ObservableObject {
         return nil
     }
 
-    private func normalizedDeviceCode(from candidate: String) -> String? {
+    private func normalizedDeviceCode(from candidate: String, allowPlainCode: Bool = false) -> String? {
         var value = candidate.uppercased()
         value = value.replacingOccurrences(of: #"\s+"#, with: "-", options: .regularExpression)
         value = value.replacingOccurrences(of: #"[^A-Z0-9\-]"#, with: "", options: .regularExpression)
@@ -1562,12 +1586,24 @@ final class AppViewModel: ObservableObject {
         let digits = value.filter(\.isNumber).count
         guard letters > 0, digits > 0 else { return nil }
 
-        guard value.contains("-") else { return nil }
         let groupedPattern = #"^[A-Z0-9]{3,5}(?:-[A-Z0-9]{3,5}){1,3}$"#
+        let plainPattern = #"^[A-Z0-9]{6,12}$"#
         if value.range(of: groupedPattern, options: .regularExpression) != nil {
             return value
         }
+        if allowPlainCode, value.range(of: plainPattern, options: .regularExpression) != nil {
+            return value
+        }
         return nil
+    }
+
+    private func containsDeviceCodeCue(_ lowered: String) -> Bool {
+        lowered.contains("never share this code")
+            || lowered.contains("device code")
+            || lowered.contains("enter code")
+            || lowered.contains("verification code")
+            || lowered.contains("one-time code")
+            || lowered.contains("user code")
     }
 
     private func firstRegexCapture(in text: String, pattern: String) -> String? {
