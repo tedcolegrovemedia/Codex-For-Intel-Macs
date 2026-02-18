@@ -1396,7 +1396,9 @@ final class AppViewModel: ObservableObject {
         guard !trimmed.isEmpty else { return }
 
         if loginFlowAwaitingCodeLine, let code = extractStandaloneDeviceCode(from: trimmed) {
-            loginDeviceCode = code
+            if loginDeviceCode == nil {
+                loginDeviceCode = code
+            }
             loginFlowAwaitingCodeLine = false
             loginFlowSawDeviceCodePrompt = true
             openCanonicalDeviceAuthURLIfNeeded()
@@ -1413,7 +1415,9 @@ final class AppViewModel: ObservableObject {
         }
 
         if let code = extractDeviceCode(from: trimmed) {
-            loginDeviceCode = code
+            if loginDeviceCode == nil {
+                loginDeviceCode = code
+            }
             loginFlowAwaitingCodeLine = false
             loginFlowSawDeviceCodePrompt = true
             openCanonicalDeviceAuthURLIfNeeded()
@@ -1505,7 +1509,7 @@ final class AppViewModel: ObservableObject {
                 return code
             }
         }
-        return extractStandaloneDeviceCode(from: cleaned)
+        return nil
     }
 
     private func extractStandaloneDeviceCode(from text: String) -> String? {
@@ -1526,15 +1530,14 @@ final class AppViewModel: ObservableObject {
 
     private func extractDeviceCodeFromTranscript(_ transcript: String) -> String? {
         let cleaned = stripANSIEscapeCodes(from: transcript)
-        if let direct = extractDeviceCode(from: cleaned) {
-            return direct
-        }
-
         var awaitingCodeLine = false
         for rawLine in cleaned.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !line.isEmpty else { continue }
             let lowered = line.lowercased()
+            if let inlineCode = extractDeviceCode(from: line) {
+                return inlineCode
+            }
             if lowered.contains("device code") || lowered.contains("enter code") || lowered.contains("never share this code") {
                 awaitingCodeLine = true
                 continue
@@ -1559,12 +1562,9 @@ final class AppViewModel: ObservableObject {
         let digits = value.filter(\.isNumber).count
         guard letters > 0, digits > 0 else { return nil }
 
+        guard value.contains("-") else { return nil }
         let groupedPattern = #"^[A-Z0-9]{3,5}(?:-[A-Z0-9]{3,5}){1,3}$"#
-        let plainPattern = #"^[A-Z0-9]{6,12}$"#
         if value.range(of: groupedPattern, options: .regularExpression) != nil {
-            return value
-        }
-        if value.range(of: plainPattern, options: .regularExpression) != nil {
             return value
         }
         return nil
